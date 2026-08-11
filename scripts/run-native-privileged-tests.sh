@@ -11,7 +11,7 @@ echo '+cpu +memory +pids' > /tmp/micro-sandbox-cgroup/jobs/cgroup.subtree_contro
 export MICRO_SANDBOX_CGROUP_ROOT=/tmp/micro-sandbox-cgroup/jobs
 export MICRO_SANDBOX_PRIVILEGED_TESTS=1
 
-exec cargo test --manifest-path native/Cargo.toml \
+exec cargo test --jobs 2 --manifest-path native/Cargo.toml \
   --test namespace \
   --test job_cli \
   --test supervisor_run \

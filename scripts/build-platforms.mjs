@@ -12,7 +12,7 @@ for (const platform of platforms) {
   run([
     'run', '--rm', '--platform', `linux/${platform.dockerArch}`, '-v', mount, '-w', '/work',
     'rust:1.97.1-alpine', 'sh', '-c',
-    `CARGO_TARGET_DIR=/tmp/target cargo build --locked --release --manifest-path native/Cargo.toml && mkdir -p npm/linux-${platform.npmArch}/bin && cp /tmp/target/release/micro-sandbox npm/linux-${platform.npmArch}/bin/micro-sandbox && chmod 755 npm/linux-${platform.npmArch}/bin/micro-sandbox`,
+    `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/target cargo build --locked --release --manifest-path native/Cargo.toml && mkdir -p npm/linux-${platform.npmArch}/bin && cp /tmp/target/release/micro-sandbox npm/linux-${platform.npmArch}/bin/micro-sandbox && chmod 755 npm/linux-${platform.npmArch}/bin/micro-sandbox`,
   ]);
 }
 

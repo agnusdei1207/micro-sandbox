@@ -5,7 +5,7 @@ import process from 'node:process';
 if (process.platform !== 'linux' || !['x64', 'arm64'].includes(process.arch)) {
   throw new Error('Native builds require Linux x64 or ARM64');
 }
-const result = spawnSync('cargo', ['build', '--locked', '--release', '--manifest-path', 'native/Cargo.toml'], {
+const result = spawnSync('cargo', ['build', '--jobs', '2', '--locked', '--release', '--manifest-path', 'native/Cargo.toml'], {
   stdio: 'inherit',
   shell: false,
 });

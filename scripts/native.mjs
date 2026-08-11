@@ -3,7 +3,7 @@ import process from 'node:process';
 
 const mode = process.argv[2] ?? 'test';
 const cwd = process.cwd();
-const common = ['run', '--rm', '-v', `${cwd}:/work`, '-w', '/work'];
+const common = ['run', '--rm', '-e', 'CARGO_BUILD_JOBS=2', '-v', `${cwd}:/work`, '-w', '/work'];
 const args = mode === 'kernel'
   ? [...common.slice(0, 2), '--privileged', '--cgroupns=private', ...common.slice(2), 'rust:1.97.1-bookworm', 'bash', 'scripts/run-native-privileged-tests.sh']
   : mode === 'integration'
