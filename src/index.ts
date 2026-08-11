@@ -6,6 +6,8 @@ import sharp from 'sharp';
 export { SandboxError } from './errors.js';
 export { normalizeGuestPath } from './policy/paths.js';
 export { DEFAULT_CEILINGS, DEFAULT_LIMITS, resolvePolicy } from './policy/resolve.js';
+export { resolveSupervisorBinary } from './platform/binary.js';
+export { SupervisorClient } from './supervisor/client.js';
 export type {
   IsolationPolicy,
   ResolvedPolicy,
