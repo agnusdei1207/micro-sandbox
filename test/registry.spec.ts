@@ -4,14 +4,12 @@ import { ProfileRegistry } from '../dist/api/profile-registry.js';
 import { RuntimeRegistry } from '../dist/api/runtime-registry.js';
 import { SandboxError } from '../dist/errors.js';
 
-test('RuntimeRegistry accepts immutable digest-verified runtime definitions', () => {
+test('RuntimeRegistry accepts immutable caller-owned runtime definitions', () => {
   const registry = new RuntimeRegistry();
   const runtime = registry.register({
     id: 'python-3',
     rootfs: '/opt/runtimes/python',
     entrypoint: '/usr/bin/python3',
-    digest: `sha256:${'a'.repeat(64)}`,
-    profile: 'interpreted-code',
   });
 
   assert.equal(registry.get('python-3'), runtime);
@@ -22,31 +20,28 @@ test('RuntimeRegistry accepts immutable digest-verified runtime definitions', ()
   );
 });
 
-test('RuntimeRegistry rejects duplicate IDs and invalid digests', () => {
+test('RuntimeRegistry rejects duplicate and malformed IDs', () => {
   const registry = new RuntimeRegistry();
   const definition = {
     id: 'tool',
     rootfs: '/opt/tool',
     entrypoint: '/bin/tool',
-    digest: `sha256:${'b'.repeat(64)}`,
-    profile: 'strict',
   };
   registry.register(definition);
 
   assert.throws(() => registry.register(definition), SandboxError);
-  assert.throws(() => registry.register({ ...definition, id: 'other', digest: 'latest' }), SandboxError);
+  assert.throws(() => registry.register({ ...definition, id: 'bad id' }), SandboxError);
 });
 
 test('ProfileRegistry derives a profile without mutating its base', () => {
   const registry = new ProfileRegistry();
+  registry.define('base', { limits: { memoryMb: 256, pids: 16 } });
   const profile = registry.define('small-build', {
-    base: 'compilation',
+    extends: 'base',
     limits: { memoryMb: 128, pids: 8 },
-    addSyscalls: ['madvise'],
   });
 
   assert.equal(profile.limits.memoryMb, 128);
   assert.equal(profile.limits.pids, 8);
-  assert.equal(profile.addSyscalls.includes('madvise'), true);
-  assert.equal(registry.get('compilation').addSyscalls.includes('madvise'), false);
+  assert.equal(registry.get('base').limits.memoryMb, 256);
 });

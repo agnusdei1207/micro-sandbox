@@ -1,13 +1,21 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022", "ESNext.Disposable"],
+    "target": "ES2024",
+    "lib": ["ES2024", "ESNext.Disposable"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "types": ["node"],
     "declaration": true,
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "exactOptionalPropertyTypes": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true

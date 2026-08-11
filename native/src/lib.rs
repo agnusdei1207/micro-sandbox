@@ -1,7 +1,11 @@
 pub mod config;
 pub mod error;
 #[cfg(target_os = "linux")]
+pub mod job;
+#[cfg(target_os = "linux")]
 pub mod linux;
 pub mod protocol;
 pub mod resources;
 pub mod scheduler;
+#[cfg(target_os = "linux")]
+pub mod supervisor;

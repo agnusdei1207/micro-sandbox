@@ -49,11 +49,12 @@ export class ChildProcessTransport implements SupervisorTransport {
   private stderr = '';
   private closed = false;
 
-  constructor(binary: string) {
+  constructor(binary: string, environment: Readonly<Record<string, string>> = {}) {
     this.child = spawn(binary, ['supervise'], {
       shell: false,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      env: { ...process.env, ...environment },
     });
     this.child.stdout.on('data', (chunk: Buffer) => this.handleData(chunk));
     this.child.stderr.on('data', (chunk: Buffer) => {

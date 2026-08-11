@@ -12,6 +12,8 @@ export interface SandboxOptions {
   readonly ceilings?: Partial<ResourceLimits>;
   readonly capacity?: Partial<CapacityOptions>;
   readonly supervisorBinary?: string;
+  readonly rootfs?: string;
+  readonly cgroupRoot?: string;
 }
 
 export interface CapacityOptions {
@@ -21,20 +23,18 @@ export interface CapacityOptions {
 }
 
 export interface IsolationPolicy {
-  readonly namespaces: readonly [
-    'user',
-    'pid',
-    'mount',
-    'network',
-    'ipc',
-    'uts',
-    'cgroup',
-  ];
-  readonly network: 'none';
+  readonly userNamespace: true;
+  readonly pidNamespace: true;
+  readonly mountNamespace: true;
+  readonly networkNamespace: true;
+  readonly ipcNamespace: true;
+  readonly utsNamespace: true;
+  readonly cgroupNamespace: true;
   readonly cgroupV2: true;
   readonly seccomp: true;
   readonly noNewPrivileges: true;
-  readonly dropCapabilities: true;
+  readonly capabilitiesDropped: true;
+  readonly pivotRoot: true;
 }
 
 export interface ResolvedPolicy {
@@ -44,15 +44,13 @@ export interface ResolvedPolicy {
 }
 
 export interface JobRequest {
-  readonly command: string;
+  readonly command?: string;
   readonly args?: readonly string[];
   readonly runtime?: string;
   readonly profile?: string;
   readonly cwd?: string;
   readonly env?: Readonly<Record<string, string>>;
   readonly stdin?: Uint8Array | string;
-  readonly files?: Readonly<Record<string, Uint8Array | string>>;
-  readonly outputs?: readonly string[];
   readonly limits?: Partial<ResourceLimits>;
   readonly signal?: AbortSignal;
 }
@@ -60,15 +58,15 @@ export interface JobRequest {
 export interface JobMetrics {
   readonly durationMs: number;
   readonly peakMemoryBytes: number;
-  readonly cpuTimeMs: number;
 }
 
 export interface JobResult {
   readonly exitCode: number | null;
-  readonly signal: string | null;
+  readonly signal: number | null;
+  readonly timedOut: boolean;
+  readonly outputLimitExceeded: boolean;
   readonly stdout: Buffer;
   readonly stderr: Buffer;
-  readonly files: Readonly<Record<string, Buffer>>;
   readonly isolation: Readonly<IsolationPolicy>;
   readonly metrics: Readonly<JobMetrics>;
 }
@@ -82,20 +80,14 @@ export interface RuntimeDefinition {
   readonly id: string;
   readonly rootfs: string;
   readonly entrypoint: string;
-  readonly digest: `sha256:${string}`;
-  readonly profile: string;
-  readonly environment?: readonly string[];
 }
 
 export interface ProfileDefinition {
-  readonly base: string;
+  readonly extends?: string;
   readonly limits?: Partial<ResourceLimits>;
-  readonly addSyscalls?: readonly string[];
 }
 
 export interface ResolvedProfile {
   readonly name: string;
-  readonly base: string;
   readonly limits: Readonly<Partial<ResourceLimits>>;
-  readonly addSyscalls: readonly string[];
 }

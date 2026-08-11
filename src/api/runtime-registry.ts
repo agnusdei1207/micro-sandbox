@@ -3,7 +3,6 @@ import { SandboxError } from '../errors.js';
 import type { RuntimeDefinition } from '../types.js';
 
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62})$/;
-const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 
 export class RuntimeRegistry {
   private readonly runtimes = new Map<string, Readonly<RuntimeDefinition>>();
@@ -15,11 +14,6 @@ export class RuntimeRegistry {
     if (this.runtimes.has(definition.id)) {
       throw policyError('Runtime ID is already registered', { id: definition.id });
     }
-    if (!DIGEST_PATTERN.test(definition.digest)) {
-      throw policyError('Runtime digest must be a lowercase SHA-256 digest', {
-        digest: definition.digest,
-      });
-    }
     if (!path.isAbsolute(definition.rootfs)) {
       throw policyError('Runtime rootfs must be an absolute host path');
     }
@@ -29,7 +23,6 @@ export class RuntimeRegistry {
 
     const runtime = Object.freeze({
       ...definition,
-      environment: Object.freeze([...(definition.environment ?? [])]),
     });
     this.runtimes.set(runtime.id, runtime);
     return runtime;

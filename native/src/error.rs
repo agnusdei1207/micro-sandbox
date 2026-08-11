@@ -9,10 +9,14 @@ pub enum SandboxError {
     InvalidCgroupValue(String),
     #[error("sandbox capacity is exhausted")]
     CapacityExceeded,
+    #[error("sandbox request was cancelled")]
+    Cancelled,
     #[error("policy violation: {0}")]
     PolicyViolation(String),
     #[error("cgroup v2 isolation is unavailable: {0}")]
     CgroupUnavailable(String),
+    #[error("security control failed: {0}")]
+    Security(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -25,8 +29,10 @@ impl SandboxError {
             Self::Protocol(_) => "PROTOCOL_ERROR",
             Self::InvalidCgroupValue(_) => "CGROUP_ERROR",
             Self::CapacityExceeded => "CAPACITY_EXCEEDED",
+            Self::Cancelled => "CANCELLED",
             Self::PolicyViolation(_) => "POLICY_VIOLATION",
             Self::CgroupUnavailable(_) => "CGROUP_DELEGATION_REQUIRED",
+            Self::Security(_) => "ISOLATION_UNAVAILABLE",
             Self::Io(_) | Self::Json(_) => "INTERNAL_ERROR",
         }
     }

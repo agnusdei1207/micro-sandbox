@@ -1,0 +1,17 @@
+{
+  "name": "micro-sandbox-linux-x64",
+  "version": "0.0.1",
+  "description": "Linux x64 native binary for micro-sandbox",
+  "license": "MIT",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "engines": { "node": ">=24.18.0" },
+  "files": ["bin"],
+  "bin": { "micro-sandbox-native": "bin/micro-sandbox" },
+  "exports": { "./bin/micro-sandbox": "./bin/micro-sandbox" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agnusdei1207/micro-sandbox.git"
+  },
+  "publishConfig": { "access": "public" }
+}

@@ -1,6 +1,7 @@
 node_modules
 dist
 native/target
+npm/*/bin/micro-sandbox
 .worktrees
 .DS_Store
 *.log

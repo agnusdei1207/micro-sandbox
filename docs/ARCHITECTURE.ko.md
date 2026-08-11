@@ -1,146 +1,91 @@
 # micro-sandbox 아키텍처
 
-## 목적
+## 1. 범위와 지원 환경
 
-`micro-sandbox`는 npm으로 배포되는 범용 Linux 프로세스 샌드박스다. 신뢰할 수 없는 명령, 코드, 파일 처리기를 커널로 격리된 일회성 작업에서 실행한다. 형식별 parser, 저장소 adapter, cloud integration은 포함하지 않는다.
+`micro-sandbox`는 npm으로 배포되는 범용 프로세스 샌드박스다. 호출자가 선택한 프로그램을 실행하며, 파일 형식 파싱·새니타이징·스토리지·클라우드 연동은 신뢰 코어 밖에 둔다.
 
-지원 호스트:
+- 실행 환경: Linux 커널 5.15 이상, cgroup v2, x86-64 또는 ARM64.
+- 개발 도구: Node.js 24.18+ LTS, Rust 1.97.1, Edition 2024.
+- 개발 환경: Windows와 Linux에서 TypeScript 테스트와 패키징을 지원하며, 커널 통합 테스트는 Linux가 필요하다.
+- 경계: namespace는 호스트 커널을 공유한다. 강화된 프로세스/컨테이너 경계이며 VM 경계는 아니다.
 
-- Linux 커널 5.15 이상
-- x86-64와 ARM64
-- 위임된 subtree가 있는 cgroup v2
-- 비특권 user namespace 활성화 또는 명시적으로 설정한 launcher
+필수 제어를 사용할 수 없으면 fail-closed로 실패한다. 비격리 fallback은 없다.
 
-패키지는 fail-closed로 동작한다. 격리되지 않은 fallback을 sandboxed로 보고하지 않는다.
-
-## 전체 구조
+## 2. 구성 요소
 
 ```text
 Node.js API
-    |
-    | 크기가 제한된 버전형 IPC
-    v
-Rust supervisor (Sandbox 인스턴스마다 자식 프로세스 하나)
-    |-- 리소스 측정, 예약 원장, 대기열
-    |-- runtime 및 정책 registry
-    |-- cgroup 수명 주기와 작업 감시
-    `-- 작업마다 일회성 자식 프로세스 하나
-          |-- USER, PID, MOUNT, NET, IPC, UTS, CGROUP namespace
-          |-- private tmpfs root와 pivot_root
-          |-- no_new_privs, capability 제거, seccomp
-          `-- 명령, 코드 runtime 또는 sanitizer
+  ├─ 정책 상한, FIFO 큐, runtime, 리소스 profile
+  └─ 크기가 제한된 protocol v1
+       └─ Rust supervisor
+            ├─ 실시간 cgroup 용량 측정 + 예약 원장
+            └─ 작업별 launcher 프로세스
+                 └─ USER/PID/MNT/NET/IPC/UTS/CGROUP namespace의 clone3 자식
 ```
 
-Supervisor는 신뢰 영역이지만 비신뢰 파일 형식을 파싱하지 않는다. 파서와 사용자 명령은 작업 프로세스 안에서만 실행한다.
+장기 실행 supervisor는 호출자 plugin을 로드하거나 파일을 파싱하지 않는다. 각 launcher는 `clone3` 전까지 새 단일 스레드 프로세스이므로 supervisor 스레드 상태를 fork 이후에 건드리지 않는다.
 
-## 공개 모델
+## 3. 공개 실행 모델
 
-`createSandbox()`는 supervisor를 지연 실행한다. `sandbox.run()`은 작업을 실행한다. `sandbox.close()`는 새 작업을 막고, 실행 중 작업을 완료하거나 취소한 뒤 모든 리소스를 제거한다.
+`Sandbox.run()`은 명령 또는 등록된 runtime entrypoint, 인자, 정규화된 guest 작업 디렉터리, 명시적 환경 변수, 제한된 stdin, 리소스 override, `AbortSignal`을 받는다. 결과에는 종료 코드, 숫자 signal, timeout/출력 초과 여부, 제한된 stdout/stderr, peak memory, 실행 시간, 적용된 격리 보고서가 들어간다.
 
-```ts
-await using sandbox = await createSandbox();
+Runtime은 호출자가 소유한 root 디렉터리와 entrypoint다. Profile은 호출자가 정의하는 리소스 제한 template이다. 둘 다 parser를 추가하거나 격리를 약화하지 않는다.
 
-const result = await sandbox.run({
-  command: "/app/tool",
-  args: ["--input", "/workspace/input"],
-  files: { "/workspace/input": input },
-  outputs: ["/workspace/output"],
-});
-```
+## 4. 정책과 용량
 
-같은 primitive로 네이티브 도구, 등록된 Node/Python runtime, 컴파일, 미디어 변환, 사용자가 제공한 sanitizer를 실행한다.
+정책 순서는 패키지 기본값 → instance 기본값/상한 → profile → 작업 override다. 기본값은 5초, 256 MiB, CPU 0.5, PID 16개, 입력 64 KiB, 전체 출력 256 KiB다. 기본 상한은 30초, 512 MiB, CPU 1, PID 32개, 입력과 전체 출력 각각 512 KiB다. Swap은 항상 0이다.
 
-## 설정
+Supervisor는 매 실행 직전에 위임된 cgroup의 현재/최대 memory와 PID, CPU quota를 읽는다. 무제한 값은 호스트 가용량으로 대체한다. 운영 여유를 위해 80%만 admission 대상으로 사용한다. 동시에 원자적 예약 원장이 활성 작업의 선언 상한을 예약한다. 실시간 용량이나 예약 용량이 부족하면 프로세스를 만들기 전에 `CAPACITY_EXCEEDED`를 반환한다.
 
-정책은 다음 순서로 합성한다.
+Node 계층은 제한된 FIFO 큐와 설정 가능한 동시 실행 수를 제공한다. 최종 강제 경계는 커널 cgroup이다.
 
-1. 안전한 패키지 기본값
-2. 인스턴스 기본값과 운영자 상한
-3. 이름이 있는 runtime 또는 작업 profile
-4. 운영자 상한 안의 작업별 값
+## 5. 작업 수명 주기
 
-기본 제한:
+1. Protocol 크기, 경로, NUL, 환경 변수, base64 입력, 숫자 제한을 검증한다.
+2. 실시간 용량을 다시 확인하고 선언된 최대치를 원자적으로 예약한다.
+3. 작업 cgroup을 만들고 memory, swap 0, CPU, PID 제한을 기록한다.
+4. 전용 launcher를 시작하고 pidfd를 연 뒤 모든 namespace와 `CLONE_INTO_CGROUP`을 사용해 `clone3`를 호출한다.
+5. 부모가 한 항목짜리 UID/GID map을 기록하는 동안 자식을 동기화 pipe에서 대기시킨다.
+6. Mount propagation을 private으로 만들고 tmpfs root를 생성한다. Runtime 디렉터리를 read-only bind하고 안전한 device만 추가한 뒤 private `/proc`, `/tmp`를 mount하고 `pivot_root`로 호스트 root를 분리한다.
+7. 작업 디렉터리를 설정하고 모든 capability set을 0으로 만든다. `no_new_privs`와 seccomp를 적용하고 helper FD는 exec에서 닫은 뒤, 호출자가 shell을 명시하지 않은 한 shell 없이 실행한다.
+8. 전체 크기 제한 아래 stdin/stdout/stderr를 동시에 처리한다. Wall time과 취소는 pidfd와 `cgroup.kill`로 프로세스 트리 전체에 적용한다.
+9. Namespace init을 회수하고 남은 자식을 종료한다. Peak memory를 읽고 cgroup/staging 디렉터리를 제거한 다음 예약을 반환한다.
 
-| 리소스 | 기본값 | 기본 상한 |
-|---|---:|---:|
-| 실행 시간 | 5초 | 30초 |
-| 메모리 | 256 MiB | 512 MiB |
-| Swap | 0 | 0 |
-| CPU quota | 0.5 core | 1 core |
-| 프로세스 | 16 | 32 |
-| 입력 | 25 MiB | 100 MiB |
-| 전체 출력 | 50 MiB | 200 MiB |
+격리 자식에는 부모 종료 signal이 설정되며, launcher가 강제 종료되면 supervisor가 cgroup을 재정리한다.
 
-운영자는 기본값과 상한을 변경할 수 있다. 작업은 그 범위 안의 값만 요청할 수 있다. 핵심 격리 불변 조건은 끌 수 없다.
+## 6. 파일시스템과 runtime 모델
 
-## 작업 수명 주기
+Runtime root 전체를 그대로 노출하지 않는다. `/bin`, `/sbin`, `/usr`, `/lib`, `/lib64`만 새 tmpfs root에 재귀적으로 read-only bind한다. 호스트 `/etc`, home, 애플리케이션 secret, socket, 상속 환경 변수는 없다. `/tmp`는 private이며 크기가 제한되고 `nodev`, `nosuid`, `noexec`다. `/dev`에는 bind-mounted `null`, `zero`, `random`, `urandom`만 둔다.
 
-1. 요청, 경로, runtime digest, 정책, 크기 제한을 검증한다.
-2. 유효 cgroup의 CPU, 메모리, PID 잔여량을 읽는다.
-3. 용량을 원자적으로 예약하거나 대기열 backpressure를 적용한다.
-4. 작업 cgroup을 만들고 설정한다.
-5. `clone3()`로 자식을 생성하면서 처음부터 해당 cgroup에 배치한다.
-6. 자식이 동기화 파이프에서 대기하는 동안 UID/GID mapping을 기록한다.
-7. Mount propagation을 private로 만들고, tmpfs root를 구성하고, 검증된 runtime asset만 bind한 뒤 `pivot_root()`를 호출한다.
-8. Network namespace를 단절 상태로 유지하고, 상속 FD를 닫고, `no_new_privs`와 capability 제거 후 profile의 seccomp filter를 적용한다.
-9. Supervisor가 실행 시간, 출력, 메모리, CPU, 자손을 제한하며 작업을 실행한다.
-10. 선언된 출력만 검증하고 수집한다.
-11. pidfd와 `cgroup.kill`로 남은 자손을 종료하고 회수한 뒤 root를 unmount하고 cgroup을 삭제하고 예약을 해제한다.
+0.0.1은 임의 output 파일을 안전하게 회수한다고 과장하지 않고, 크기가 제한된 stdin/stdout/stderr만 공개한다. 대용량 artifact 전송은 샌드박스 경계를 바꾸지 않는 별도 검증 data plane으로 이후 추가할 수 있다.
 
-모든 실패는 같은 정리 경로를 사용한다.
+## 7. 보안 불변 조건
 
-## 보안 불변 조건
+- Network namespace에는 호스트 interface나 route가 없다.
+- Effective, permitted, inheritable, bounding, ambient capability mask가 모두 0이어야 한다.
+- `no_new_privs`와 baseline seccomp filter는 필수다.
+- Mount, namespace 재할당, ptrace, BPF, kernel module, keyring, reboot, swap, kexec, perf, userfaultfd 등 고위험 syscall을 거부한다.
+- 경로는 정규화된 절대 guest 경로다. 인자와 환경 변수는 NUL을 거부하고 환경 크기를 제한한다.
+- Control frame은 1 MiB, stdout과 stderr는 하나의 전체 출력 budget으로 제한한다.
+- Job ID는 cgroup 경로가 되기 전에 제한한다.
+- clone3, namespace, 위임 controller, cgroup v2, pivot root, capability 제거, seccomp 중 하나라도 없으면 작업을 중단한다.
 
-- Shell interpolation을 사용하지 않는다.
-- 기본적으로 호스트 네트워크를 제공하지 않는다.
-- 기본적으로 호스트 파일시스템, 환경변수, FD를 상속하지 않는다.
-- 정규화된 guest 절대 경로만 허용하며 `..`, symlink, device, mount 탈출을 막는다.
-- Runtime bundle과 custom processor는 시작 시 등록하고 digest를 검증한다.
-- 확장 정책은 격리를 강화할 수 있지만 금지 capability나 호스트 접근을 활성화할 수 없다.
-- 성공 결과에는 격리 보고서가 포함된다. 필수 제어가 없으면 `ISOLATION_UNAVAILABLE`을 반환한다.
-- Namespace는 호스트 커널을 공유하므로 VM 경계는 아니다.
+Seccomp denylist는 namespace/capability/filesystem 격리를 보강하는 방어 계층이다. VM이나 미래의 모든 커널 취약점에 대한 증명으로 표현하지 않는다.
 
-## 용량과 안정성
+## 8. 확장성과 예제
 
-Rust supervisor가 단일 예약 원장을 소유해 동시 초과 수용을 막는다. 가용 용량은 호스트 가용량과 supervisor의 유효 cgroup 잔여량 중 작은 값에서 운영자 reserve와 활성 예약을 뺀 값이다.
+확장은 조합으로 해결한다. 호출자 소유 runtime을 등록하고 그 binary를 실행한다. 이미지 재인코딩은 ImageMagick, 코드 실행은 Node·Python·compiler·사용자 executable을 사용할 수 있다. 예제는 범용 작업 요청만 만든다. 해당 도구를 패키지 dependency로 넣지 않는다.
 
-자동 동시성은 CPU quota, 메모리, PID, 현재 작업, Linux pressure stall information을 고려한다. 압력이 높으면 신규 수용을 멈춘다. Overload 정책에 따라 제한된 FIFO 대기열에서 기다리거나 `CAPACITY_EXCEEDED`를 반환한다.
+운영자는 안전한 기본값, 강제 상한, queue 용량, 리소스 profile, runtime rootfs, entrypoint, native binary 경로를 바꿀 수 있다. Namespace, network, cgroup, capability, pivot-root, seccomp 제어는 끌 수 없다.
 
-Node client는 heartbeat를 감시한다. Supervisor가 종료되면 활성 작업을 일관되게 실패 처리하고 남은 리소스를 정리하며, 이후 요청에서 재시작할 수 있다. 출력 폭주, 무시된 signal, double fork, OOM, timeout은 cgroup 경계에서 종료한다.
+## 9. 배포와 패키징
 
-## 확장성
+서비스에는 `cpu`, `memory`, `pids` controller가 활성화된 쓰기 가능한 cgroup v2 하위 트리가 위임되어야 한다. systemd에서는 `Delegate=cpu memory pids`를 사용하고, 만들어진 비어 있는 자식 subtree를 `cgroupRoot` 또는 `MICRO_SANDBOX_CGROUP_ROOT`로 전달한다. Supervisor는 이를 검증하며 약한 모드를 자동 선택하지 않는다.
 
-확장은 supervisor에 동적 라이브러리를 로드하지 않고 격리된 실행 파일로 제공한다.
+메인 npm 패키지는 Windows 개발 환경에도 설치되지만 실행은 명확히 거부한다. 선택 dependency인 `micro-sandbox-linux-x64`와 `micro-sandbox-linux-arm64`가 각 ELF binary를 제공한다. CI는 두 아키텍처에서 native build/test를 수행하며, release는 platform 패키지를 먼저 provenance와 함께 배포한다.
 
-등록 runtime은 불변 rootfs 또는 bundle, entrypoint, digest, 기본 profile, 허용 환경변수 키를 정의한다. 작업 profile은 내장 profile을 상속하며 hard deny 목록 안에서 제한을 조정하거나 검토된 syscall을 추가할 수 있다. 사용자 요청은 runtime, 실행 파일 경로, mount, seccomp 정책을 등록할 수 없다.
+## 10. 검증과 릴리즈 게이트
 
-내장 profile은 strict native 실행, interpreted code, compilation, media processing을 제공한다. Recipe는 sanitizer나 transcoder 등록 방법을 보여주되 parser, 형식 정책, 저장 위치를 핵심 패키지에 포함하지 않는다.
+필수 게이트는 엄격한 TypeScript compile, Windows/Linux Node 단위·API 테스트, Rustfmt, warning을 모두 거부하는 Clippy, Rust 단위·통합 테스트, 실제 privileged cgroup/namespace/seccomp 테스트, 취소·timeout 프로세스 트리 정리, 전체 출력 제한, 용량 경쟁 테스트, npm audit, ELF 아키텍처/실행 권한 검사, tarball clean install, 배포된 패키지 smoke test다.
 
-## 오류와 관측성
-
-API는 `CAPACITY_EXCEEDED`, `POLICY_VIOLATION`, `ISOLATION_UNAVAILABLE`, `TIMEOUT`, `OUT_OF_MEMORY`, `OUTPUT_TOO_LARGE`, `SECCOMP_VIOLATION`, `PROCESSOR_CRASH` 같은 안정된 코드를 사용한다.
-
-결과에는 exit status, 제한된 stdout/stderr, 선언된 출력 파일, 적용된 격리 제어, 리소스 사용량, 실행 시간이 포함된다. Hook은 파일 내용, 비밀값, 상속 환경변수 없이 수명 주기 이벤트를 받는다.
-
-## 배포와 검색 노출
-
-JavaScript 패키지는 Linux x86-64 또는 ARM64용 optional platform package에서 바이너리를 선택한다. 미지원 플랫폼은 초기화 단계에서 명확한 진단으로 실패한다.
-
-npm manifest와 README는 짧고 일관된 description과 핵심 검색어를 사용한다: `sandbox`, `linux-sandbox`, `nodejs-sandbox`, `process-isolation`, `untrusted-code`, `cgroups`, `namespaces`, `seccomp`, `resource-limits`, `rootless`. Repository, homepage, issues, engines, OS, CPU, license, provenance metadata를 정확하게 유지한다. GitHub topics는 주요 npm keyword와 맞춘다.
-
-## 검증 게이트
-
-릴리스 조건:
-
-- Rust와 TypeScript unit test
-- Protocol 및 정책 호환성 test
-- Linux x86-64와 ARM64 integration test
-- Namespace, cgroup, mount, network, seccomp 적용 검증
-- Fork, memory, CPU, output, file-count, decompression bomb
-- Symlink, path traversal, FD, 환경변수, `/proc`, network 탈출 시도
-- Timeout, OOM, supervisor crash, cancellation, cleanup fault injection
-- 동시 수용과 리소스 예약 stress test
-- 반복 실행 leak 및 soak test
-- npm tarball 설치와 smoke test
-
-필수 격리가 생략되거나, 정리 후 자식 또는 cgroup이 남거나, 어느 아키텍처든 실패하거나, npm 압축 산출물이 독립 실행되지 않으면 배포를 막는다.
+격리가 생략되거나, 출력/control 제한을 우회하거나, 자식·cgroup·staging root가 남거나, x64/ARM64 패키징이 잘못되거나, metadata가 실제와 다르거나, clean consumer가 배포 패키지를 실행하지 못하면 release를 중단한다.

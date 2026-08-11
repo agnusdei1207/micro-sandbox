@@ -1,146 +1,91 @@
 # micro-sandbox architecture
 
-## Purpose
+## 1. Scope and support
 
-`micro-sandbox` is a general-purpose Linux process sandbox distributed as an npm package. It runs untrusted commands, code, and file processors in disposable kernel-isolated jobs. It contains no format-specific parser, storage adapter, or cloud integration.
+`micro-sandbox` is a general-purpose process sandbox distributed through npm. It executes caller-selected programs; format parsing, sanitizing, storage, and cloud integration remain outside the trusted core.
 
-Supported hosts:
+- Runtime: Linux kernel 5.15+, cgroup v2, x86-64 or ARM64.
+- Tooling: Node.js 24.18+ LTS, Rust 1.97.1, Edition 2024.
+- Development: TypeScript tests and packaging work on Windows and Linux; kernel integration requires Linux.
+- Boundary: namespaces share the host kernel. This is a hardened process/container boundary, not a VM boundary.
 
-- Linux kernel 5.15 or newer
-- x86-64 and ARM64
-- cgroup v2 with a delegated subtree
-- unprivileged user namespaces enabled, or an explicitly configured launcher
+Mandatory controls fail closed. There is no unisolated fallback.
 
-The package fails closed. It never reports an unisolated fallback as sandboxed.
-
-## System shape
+## 2. Components
 
 ```text
 Node.js API
-    |
-    | bounded, versioned IPC
-    v
-Rust supervisor (one child per Sandbox instance)
-    |-- resource probe, reservation ledger, and queue
-    |-- runtime and policy registry
-    |-- cgroup lifecycle and job monitoring
-    `-- one disposable child per job
-          |-- USER, PID, MOUNT, NET, IPC, UTS, CGROUP namespaces
-          |-- private tmpfs root and pivot_root
-          |-- no_new_privs, dropped capabilities, seccomp
-          `-- command, code runtime, or sanitizer
+  ├─ policy ceilings, FIFO queue, runtimes, resource profiles
+  └─ bounded protocol v1
+       └─ Rust supervisor
+            ├─ live cgroup capacity probe + reservation ledger
+            └─ launcher process per job
+                 └─ clone3 child in USER/PID/MNT/NET/IPC/UTS/CGROUP namespaces
 ```
 
-The supervisor is trusted but does not parse untrusted file formats. Parsers and user commands only run inside job processes.
+The long-lived supervisor never loads caller plugins or parses caller files. Each launcher is a fresh single-threaded process before `clone3`, avoiding unsafe post-fork interaction with supervisor threads.
 
-## Public model
+## 3. Public execution model
 
-`createSandbox()` starts the supervisor lazily. `sandbox.run()` executes a job. `sandbox.close()` stops admission, drains or cancels work, and removes all resources.
+`Sandbox.run()` accepts a command or a registered runtime entrypoint, arguments, a normalized guest working directory, explicit environment values, bounded stdin, resource overrides, and an `AbortSignal`. It returns exit status, numeric signal, timeout/output-limit flags, bounded stdout/stderr, peak memory, duration, and the applied isolation report.
 
-```ts
-await using sandbox = await createSandbox();
+Runtimes are caller-owned root directories plus entrypoints. Profiles are caller-defined resource-limit templates. Neither mechanism adds parsers or weakens isolation.
 
-const result = await sandbox.run({
-  command: "/app/tool",
-  args: ["--input", "/workspace/input"],
-  files: { "/workspace/input": input },
-  outputs: ["/workspace/output"],
-});
-```
+## 4. Policy and capacity
 
-The same primitive supports native tools, registered Node or Python runtimes, compilation, media conversion, and user-supplied sanitizers.
+Policy order is package defaults → instance defaults/ceilings → profile → job override. Defaults are 5 seconds, 256 MiB, 0.5 CPU, 16 PIDs, 64 KiB input, and 256 KiB combined output. Default ceilings are 30 seconds, 512 MiB, 1 CPU, 32 PIDs, and 512 KiB for input and combined output. Swap is always zero.
 
-## Configuration
+Before every launch, the supervisor reads the delegated cgroup's current/max memory and PID values plus CPU quota. Unbounded values use host availability. Only 80% is admitted, leaving an operating reserve. An atomic ledger also reserves each active job's declared maximum; insufficient live or reserved capacity returns `CAPACITY_EXCEEDED` before process creation.
 
-Policy is layered in this order:
+The Node layer provides a bounded FIFO queue and configurable in-flight count. Kernel cgroups remain the final enforcement boundary.
 
-1. safe package defaults;
-2. instance defaults and operator ceilings;
-3. a named runtime or task profile;
-4. per-job values within the operator ceilings.
+## 5. Job lifecycle
 
-Default limits:
+1. Validate protocol size, paths, NULs, environment, base64 input, and numeric limits.
+2. Recheck live capacity and atomically reserve the declared maximum.
+3. Create the job cgroup and write memory, zero-swap, CPU, and PID limits.
+4. Start a dedicated launcher, open a pidfd, and call `clone3` with all namespaces and `CLONE_INTO_CGROUP`.
+5. Block the child while the parent writes one-entry UID/GID maps.
+6. Make mount propagation private, mount a tmpfs root, read-only bind runtime directories, add only safe devices, mount private `/proc` and `/tmp`, then call `pivot_root` and detach the host root.
+7. Set the working directory, clear every capability set, set `no_new_privs`, install seccomp, close helper descriptors on exec, and execute without a shell unless the caller explicitly selected one.
+8. Drain stdin/stdout/stderr concurrently under aggregate bounds. Enforce wall time and process-tree cancellation with pidfds plus `cgroup.kill`.
+9. Reap the namespace init, kill remaining descendants, read peak memory, remove the cgroup/staging directory, and release the reservation.
 
-| Resource | Default | Default ceiling |
-|---|---:|---:|
-| Wall time | 5 s | 30 s |
-| Memory | 256 MiB | 512 MiB |
-| Swap | 0 | 0 |
-| CPU quota | 0.5 core | 1 core |
-| Processes | 16 | 32 |
-| Input | 25 MiB | 100 MiB |
-| Combined output | 50 MiB | 200 MiB |
+The isolated child receives a parent-death signal, and the supervisor reconciles the cgroup if a launcher is killed.
 
-Operators may change defaults and ceilings. Jobs may only request values within them. Core isolation invariants cannot be disabled.
+## 6. Filesystem and runtime model
 
-## Job lifecycle
+The runtime root is never exposed wholesale. Only `/bin`, `/sbin`, `/usr`, `/lib`, and `/lib64` are recursively bound read-only into a fresh tmpfs root. Host `/etc`, home directories, application secrets, sockets, and inherited environment are absent. `/tmp` is private, size-limited, `nodev`, `nosuid`, and `noexec`. `/dev` contains only bind-mounted `null`, `zero`, `random`, and `urandom`.
 
-1. Validate the request, paths, runtime digest, policy, and size bounds.
-2. Read effective cgroup CPU, memory, and PID capacity.
-3. Atomically reserve capacity or apply queue backpressure.
-4. Create and configure the job cgroup.
-5. Create the child with `clone3()` and place it in the cgroup from birth.
-6. Write UID/GID mappings while the child is blocked on a synchronization pipe.
-7. Make mount propagation private; build a tmpfs root; bind only verified runtime assets; call `pivot_root()`.
-8. Keep the network namespace disconnected, close inherited descriptors, set `no_new_privs`, drop capabilities, and install the profile's seccomp filter.
-9. Execute the workload while the supervisor bounds time, output, memory, CPU, and descendants.
-10. Validate and collect declared outputs.
-11. Kill remaining descendants with pidfds and `cgroup.kill`, reap them, unmount the root, remove the cgroup, and release the reservation.
+Version 0.0.1 intentionally exposes bounded stdin/stdout/stderr rather than pretending arbitrary output files can be safely recovered. Larger artifact transport can be added later as a separate, verified data plane without changing the sandbox boundary.
 
-Every failure follows the same cleanup path.
+## 7. Security invariants
 
-## Security invariants
+- Network namespace has no host interfaces or routes.
+- Effective, permitted, inheritable, bounding, and ambient capability masks must all be zero.
+- `no_new_privs` and the baseline seccomp filter are mandatory.
+- Mount, namespace reassignment, ptrace, BPF, kernel-module, keyring, reboot, swap, kexec, perf, userfaultfd, and related high-risk syscalls are denied.
+- Paths are normalized absolute guest paths; arguments and environment reject NULs and bounded environment sizes.
+- Control frames are limited to 1 MiB; stdout and stderr share one aggregate output budget.
+- Job IDs are constrained before becoming cgroup paths.
+- Missing clone3, namespaces, delegated controllers, cgroup v2, pivot root, capability clearing, or seccomp aborts the job.
 
-- No shell interpolation.
-- No host network by default.
-- No host filesystem, environment, or file descriptor inheritance by default.
-- Only normalized absolute guest paths; no `..`, symlink, device, or mount escape.
-- Runtime bundles and custom processors are registered at startup and digest-verified.
-- Extension policies can tighten isolation but cannot enable forbidden capabilities or host access.
-- A successful result includes an isolation report. Missing mandatory controls produce `ISOLATION_UNAVAILABLE`.
-- Namespace isolation shares the host kernel; this is not a VM boundary.
+The denylist seccomp layer is defense in depth around namespace/capability/filesystem isolation; it is not advertised as a VM or a proof against every future kernel vulnerability.
 
-## Capacity and stability
+## 8. Extensibility and examples
 
-The Rust supervisor owns a single reservation ledger to avoid concurrent over-admission. Available capacity is the minimum of host availability and the supervisor's effective cgroup headroom, minus an operator reserve and active reservations.
+Extension is composition: register a caller-owned runtime and execute its binary. Image re-encoding can invoke ImageMagick; code execution can invoke Node, Python, a compiler, or a custom executable. The examples only build generic job requests. They do not make those tools dependencies of the package.
 
-Automatic concurrency considers CPU quota, memory, PIDs, current jobs, and Linux pressure stall information. On pressure it pauses admission. The configured overload mode either waits in a bounded FIFO queue or returns `CAPACITY_EXCEEDED`.
+Operators can customize safe defaults, hard ceilings, queue capacity, resource profiles, runtime rootfs paths, entrypoints, and the native binary path. Namespace, network, cgroup, capability, pivot-root, and seccomp controls are not configurable off.
 
-The Node client monitors a heartbeat. If the supervisor exits, active jobs fail deterministically, stale resources are reconciled, and a later request may restart it. Output floods, ignored signals, double forks, OOMs, and timeouts are terminated at the cgroup boundary.
+## 9. Deployment and packaging
 
-## Extensibility
+The service must receive a writable cgroup v2 subtree delegated with `cpu`, `memory`, and `pids` controllers enabled. With systemd, use `Delegate=cpu memory pids` and pass the resulting empty child subtree as `cgroupRoot` or `MICRO_SANDBOX_CGROUP_ROOT`. The supervisor validates it and never silently chooses a weaker mode.
 
-Extensions are isolated executables, never dynamic libraries loaded into the supervisor.
+The main npm package installs on Windows for development but rejects execution there. Optional `micro-sandbox-linux-x64` and `micro-sandbox-linux-arm64` packages carry the corresponding ELF binary. CI builds and tests natively on both architectures; releases publish platform packages before the main package with npm provenance.
 
-A registered runtime specifies an immutable rootfs or bundle, entrypoint, digest, base profile, and allowed environment keys. A task profile derives from a built-in profile and may adjust limits or add reviewed syscalls within a hard deny set. User-controlled requests cannot register runtimes, executable paths, mounts, or seccomp policies.
+## 10. Verification and release gates
 
-Built-in profiles cover strict native execution, interpreted code, compilation, and media processing. Recipes demonstrate how to register a sanitizer or transcoder without making its parser, format policy, or storage destination part of the core package.
+Required gates are strict TypeScript compilation, Node unit/API tests on Windows and Linux, Rustfmt, Clippy with warnings denied, Rust unit/integration tests, real privileged cgroup/namespace/seccomp tests, cancellation and timeout process-tree cleanup, aggregate output limits, capacity race tests, npm audit, ELF architecture/mode checks, packed-tarball clean installs, and published-package smoke tests.
 
-## Errors and observability
-
-The API uses stable codes such as `CAPACITY_EXCEEDED`, `POLICY_VIOLATION`, `ISOLATION_UNAVAILABLE`, `TIMEOUT`, `OUT_OF_MEMORY`, `OUTPUT_TOO_LARGE`, `SECCOMP_VIOLATION`, and `PROCESSOR_CRASH`.
-
-Results expose exit status, bounded stdout/stderr, declared output files, applied isolation controls, resource usage, and duration. Hooks receive lifecycle events without file contents, secrets, or inherited environment values.
-
-## Distribution and discovery
-
-The JavaScript package selects a platform binary from optional packages for Linux x86-64 or ARM64. Unsupported platforms fail during initialization with a direct diagnostic.
-
-The npm manifest and README use a concise, consistent description and focused search terms: `sandbox`, `linux-sandbox`, `nodejs-sandbox`, `process-isolation`, `untrusted-code`, `cgroups`, `namespaces`, `seccomp`, `resource-limits`, and `rootless`. Repository, homepage, issues, engines, OS, CPU, license, and provenance metadata remain complete and accurate. GitHub topics mirror the main npm keywords.
-
-## Verification gates
-
-Release gates include:
-
-- Rust and TypeScript unit tests;
-- protocol and policy compatibility tests;
-- Linux x86-64 and ARM64 integration tests;
-- namespace, cgroup, mount, network, and seccomp assertions;
-- fork, memory, CPU, output, file-count, and decompression bombs;
-- symlink, path traversal, descriptor, environment, `/proc`, and network escape attempts;
-- timeout, OOM, supervisor crash, cancellation, and cleanup fault injection;
-- concurrent admission and resource-reservation stress tests;
-- repeated-run leak and soak tests;
-- packed-tarball installation and smoke tests.
-
-A release is blocked if mandatory isolation is skipped, a child or cgroup survives cleanup, either architecture fails, or the packed npm artifact cannot run independently.
+A release is blocked if isolation is skipped, an output/control bound is bypassed, a child/cgroup/staging root survives, x64 or ARM64 packaging is wrong, metadata is misleading, or a clean consumer cannot run the published package.

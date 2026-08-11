@@ -1,89 +1,38 @@
-# 🚀 micro-sandbox
+# micro-sandbox
 
-> **Zero-dependency, ultra-fast in-process Linux micro-sandbox & Content Disarm and Reconstruction (CDR) library for Node.js.**
+Fail-closed Linux process isolation for Node.js. Each command runs in disposable user, PID, mount, network, IPC, UTS, and cgroup namespaces with cgroup v2 limits, a private root, dropped capabilities, `no_new_privs`, seccomp, bounded I/O, and deterministic cleanup.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Repository](https://img.shields.io/badge/GitHub-agnusdei1207%2Fmicro--sandbox-black)](https://github.com/agnusdei1207/micro-sandbox)
-
----
-
-## 📌 Key Features
-
-- ⚡ **Zero External Infrastructure**: Docker, Compose, Kubernetes, or AWS Lambda dependencies = **0**.
-- 🚀 **Sub-millisecond Speed**: Spins up an in-process sandbox in **< 1ms** using native Linux Kernel Syscalls (`CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWNS`).
-- 🛡️ **Air-Gapped Isolation**: Complete network isolation inside the sandbox process preventing SSRF, C2 communication, and data exfiltration.
-- 🧹 **Content Disarm & Reconstruction (CDR)**:
-  - **Images**: Extracts raw pixels and re-encodes into clean WebP/PNG while stripping EXIF and hidden malware.
-  - **Text/Files**: Strict UTF-8 fatal decoding + null-byte detection.
-  - **DOM/HTML**: 2-Pass DOM sanitization with Dynamic Content-Security-Policy (CSP) meta injection.
-- 🔒 **Zero-Trust Storage Pipeline**: Sandbox never holds AWS credentials. Clean assets are returned to the main process for S3 upload.
-
----
-
-## 💻 Installation
+Runtime: Linux 5.15+ on x64 or ARM64. Development and unit tests also work on Windows. Node.js 24.18+ LTS is required.
 
 ```bash
 npm install micro-sandbox
-# or
-pnpm add micro-sandbox
 ```
 
----
+```js
+import { createSandbox } from 'micro-sandbox';
 
-## 🚀 Quick Usage
-
-```typescript
-import { sanitizeFile } from 'micro-sandbox';
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-
-// 1. Sanitize raw file stream in 0.001s using sandboxed CDR
-const result = await sanitizeFile(rawFileBuffer, {
-  mimeType: 'image/jpeg',
-  outputFormat: 'webp', // Re-encode pure pixels into WebP and strip EXIF
-  timeoutMs: 5000,
+await using sandbox = await createSandbox({
+  cgroupRoot: '/sys/fs/cgroup/my-service/sandbox', // delegated cpu,memory,pids subtree
 });
 
-console.log(result.sanitized); // true
-console.log(result.mimeType);  // "image/webp"
+sandbox.registerRuntime({
+  id: 'host-tools',
+  rootfs: '/',
+  entrypoint: '/bin/sh',
+});
 
-// 2. Upload only sanitized clean asset to S3
-const s3 = new S3Client({});
-await s3.send(new PutObjectCommand({
-  Bucket: 'my-clean-assets-bucket',
-  Key: 'user-files/sanitized-photo.webp',
-  Body: result.buffer,
-  ContentType: result.mimeType,
-}));
+const result = await sandbox.run({
+  runtime: 'host-tools',
+  args: ['-c', 'printf "isolated: %s" "$MESSAGE"'],
+  env: { MESSAGE: 'hello' },
+  limits: { timeoutMs: 2_000, memoryMb: 64, pids: 8 },
+});
+
+console.log(result.stdout.toString()); // isolated: hello
 ```
 
----
+Defaults, hard ceilings, queue capacity, resource profiles, runtime roots, stdin, environment, working directory, cancellation, and the supervisor binary path are configurable. Core isolation controls cannot be disabled. Re-encoding and script recipes live in [`examples`](./examples); the package contains no file parser, sanitizer, storage adapter, or cloud coupling.
 
-## 🏗️ Architecture
+Architecture: [English](./docs/ARCHITECTURE.md) · [한국어](./docs/ARCHITECTURE.ko.md)
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ Node.js / NestJS Main Server                                            │
-│                                                                         │
-│  [ Raw File Upload ]                                                    │
-│          │                                                              │
-│          ▼ (In-Process Native Addon Call)                               │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │ micro-sandbox (In-Process Native Module)                          │  │
-│  │                                                                   │  │
-│  │  1. Linux clone() Syscall (CLONE_NEWPID | CLONE_NEWNET | ...)     │  │
-│  │  2. Cgroups v2 Resource Quota (RAM: 128MB, CPU limits)            │  │
-│  │  3. Network Namespace unassigned (Air-Gap)                        │  │
-│  │  4. RAM Buffer CDR Sanitization (Pixel Re-encoding / AST)         │  │
-│  │  5. Context Destruction & Immediate Resource Release              │  │
-│  └─────────────────────────────────┬─────────────────────────────────┘  │
-│                                    │                                    │
-│                                    ▼ (Clean Sanitized Buffer)           │
-│  [ PutObject to Main S3 Storage ]                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📜 License
-
-MIT License © 2026 agnusdei1207
+MIT

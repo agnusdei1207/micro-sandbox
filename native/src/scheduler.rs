@@ -1,7 +1,9 @@
 use crate::error::SandboxError;
+use serde::Serialize;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Capacity {
     pub memory_bytes: u64,
     pub cpu_millis: u64,
@@ -19,7 +21,7 @@ impl Capacity {
         })
     }
 
-    fn fits_within(self, limit: Self) -> bool {
+    pub fn fits_within(self, limit: Self) -> bool {
         self.memory_bytes <= limit.memory_bytes
             && self.cpu_millis <= limit.cpu_millis
             && self.pids <= limit.pids
@@ -74,6 +76,10 @@ impl Scheduler {
 
     pub fn reserved(&self) -> Capacity {
         lock_unpoisoned(&self.state).reserved
+    }
+
+    pub fn available(&self) -> Capacity {
+        self.limit.saturating_sub(self.reserved())
     }
 }
 

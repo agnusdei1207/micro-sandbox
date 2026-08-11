@@ -8,30 +8,37 @@ function successfulResult(stdout = ''): JobResult {
   return {
     exitCode: 0,
     signal: null,
+    timedOut: false,
+    outputLimitExceeded: false,
     stdout: Buffer.from(stdout),
     stderr: Buffer.alloc(0),
-    files: {},
     isolation: {
-      namespaces: ['user', 'pid', 'mount', 'network', 'ipc', 'uts', 'cgroup'],
-      network: 'none',
+      userNamespace: true,
+      pidNamespace: true,
+      mountNamespace: true,
+      networkNamespace: true,
+      ipcNamespace: true,
+      utsNamespace: true,
+      cgroupNamespace: true,
       cgroupV2: true,
       seccomp: true,
       noNewPrivileges: true,
-      dropCapabilities: true,
+      capabilitiesDropped: true,
+      pivotRoot: true,
     },
-    metrics: { durationMs: 1, peakMemoryBytes: 0, cpuTimeMs: 0 },
+    metrics: { durationMs: 1, peakMemoryBytes: 0 },
   };
 }
 
 class ControlledRequester implements SupervisorRequester {
   readonly calls: Array<{ type: string; payload: unknown; signal?: AbortSignal }> = [];
-  readonly completions: Array<(result: JobResult) => void> = [];
+  readonly completions: Array<(result: unknown) => void> = [];
   closed = false;
 
   request<T>(type: string, payload: unknown, signal?: AbortSignal): Promise<T> {
     this.calls.push({ type, payload, signal });
     return new Promise<T>((resolve, reject) => {
-      this.completions.push(resolve as (result: JobResult) => void);
+      this.completions.push(resolve as (result: unknown) => void);
       signal?.addEventListener(
         'abort',
         () => reject(new SandboxError('CANCELLED', 'cancelled')),
@@ -57,10 +64,28 @@ test('Sandbox starts its supervisor lazily and decodes a run result', async () =
   const pending = sandbox.run({ command: '/app/echo', args: ['hello'] });
   assert.equal(starts, 1);
   await new Promise((resolve) => setImmediate(resolve));
-  requester.completions[0](successfulResult('hello'));
+  requester.completions[0](wireResult('hello'));
 
   assert.equal((await pending).stdout.toString('utf8'), 'hello');
   assert.equal(requester.calls[0].type, 'run');
+  const { jobId, ...payload } = requester.calls[0].payload as { jobId: string };
+  assert.match(jobId, /^job-[a-f0-9]{32}$/);
+  assert.deepEqual(payload, {
+    rootfs: '/',
+    command: '/app/echo',
+    args: ['hello'],
+    cwd: '/',
+    env: {},
+    stdinBase64: '',
+    limits: {
+      timeoutMs: 5_000,
+      memoryMb: 256,
+      cpu: 0.5,
+      pids: 16,
+      inputBytes: 64 * 1024,
+      outputBytes: 256 * 1024,
+    },
+  });
   await sandbox.close();
 });
 
@@ -76,12 +101,12 @@ test('Sandbox admits queued jobs in FIFO order', async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(requester.calls.length, 1);
 
-  requester.completions[0](successfulResult('1'));
+  requester.completions[0](wireResult('1'));
   assert.equal((await first).stdout.toString(), '1');
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(requester.calls.length, 2);
   assert.deepEqual((requester.calls[1].payload as { args: string[] }).args, ['2']);
-  requester.completions[1](successfulResult('2'));
+  requester.completions[1](wireResult('2'));
   await second;
   await sandbox.close();
 });
@@ -99,10 +124,10 @@ test('Sandbox rejects overload beyond the bounded queue', async () => {
     sandbox.run({ command: '/app/task' }),
     (error: unknown) => error instanceof SandboxError && error.code === 'CAPACITY_EXCEEDED',
   );
-  requester.completions[0](successfulResult());
+  requester.completions[0](wireResult());
   await first;
   await new Promise((resolve) => setImmediate(resolve));
-  requester.completions[1](successfulResult());
+  requester.completions[1](wireResult());
   await second;
   await sandbox.close();
 });
@@ -118,16 +143,60 @@ test('Sandbox rejects new jobs after close starts and drains active work', async
     (error: unknown) => error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
   );
   assert.equal(requester.closed, false);
-  requester.completions[0](successfulResult());
+  requester.completions[0](wireResult());
   await active;
   await closing;
   assert.equal(requester.closed, true);
 });
 
+test('Sandbox resolves caller-owned runtimes, profiles, environment, and stdin', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({}, async () => requester);
+  sandbox.registerRuntime({
+    id: 'python',
+    rootfs: '/opt/python-root',
+    entrypoint: '/usr/bin/python3',
+  });
+  sandbox.defineProfile('small', { limits: { memoryMb: 64, pids: 4 } });
+
+  const pending = sandbox.run({
+    runtime: 'python',
+    profile: 'small',
+    args: ['-c', 'print(input())'],
+    cwd: '/tmp',
+    env: { MODE: 'safe' },
+    stdin: 'hello\n',
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const payload = requester.calls[0].payload as Record<string, unknown>;
+  assert.equal(payload.rootfs, '/opt/python-root');
+  assert.equal(payload.command, '/usr/bin/python3');
+  assert.equal(payload.cwd, '/tmp');
+  assert.deepEqual(payload.env, { MODE: 'safe' });
+  assert.equal(payload.stdinBase64, Buffer.from('hello\n').toString('base64'));
+  assert.equal((payload.limits as { memoryMb: number }).memoryMb, 64);
+  requester.completions[0](wireResult('hello\n'));
+  await pending;
+  await sandbox.close();
+});
+
+function wireResult(stdout = ''): Record<string, unknown> {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    outputLimitExceeded: false,
+    stdoutBase64: Buffer.from(stdout).toString('base64'),
+    stderrBase64: '',
+    isolation: successfulResult().isolation,
+    metrics: { durationMs: 1, peakMemoryBytes: 0 },
+  };
+}
+
 test('Sandbox close waits for the supervisor transport to finish closing', async () => {
   let releaseClose!: () => void;
   const requester: SupervisorRequester = {
-    request: async () => successfulResult(),
+    request: async () => wireResult(),
     close: () => new Promise<void>((resolve) => {
       releaseClose = resolve;
     }),

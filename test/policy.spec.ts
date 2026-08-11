@@ -14,12 +14,18 @@ test('resolvePolicy returns safe immutable defaults', () => {
   assert.deepEqual(policy.limits, DEFAULT_LIMITS);
   assert.deepEqual(policy.ceilings, DEFAULT_CEILINGS);
   assert.deepEqual(policy.isolation, {
-    namespaces: ['user', 'pid', 'mount', 'network', 'ipc', 'uts', 'cgroup'],
-    network: 'none',
+    userNamespace: true,
+    pidNamespace: true,
+    mountNamespace: true,
+    networkNamespace: true,
+    ipcNamespace: true,
+    utsNamespace: true,
+    cgroupNamespace: true,
     cgroupV2: true,
     seccomp: true,
     noNewPrivileges: true,
-    dropCapabilities: true,
+    capabilitiesDropped: true,
+    pivotRoot: true,
   });
   assert.equal(Object.isFrozen(policy), true);
   assert.equal(Object.isFrozen(policy.limits), true);

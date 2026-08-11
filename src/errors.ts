@@ -22,7 +22,7 @@ export type SandboxErrorCode =
 
 export class SandboxError extends Error {
   readonly code: SandboxErrorCode;
-  readonly details?: Readonly<Record<string, unknown>>;
+  readonly details: Readonly<Record<string, unknown>> | undefined;
 
   constructor(
     code: SandboxErrorCode,

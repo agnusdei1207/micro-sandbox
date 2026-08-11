@@ -17,6 +17,7 @@ fn refuses_overcommit_and_releases_capacity_when_reservation_drops() {
         .unwrap();
 
     assert_eq!(scheduler.reserved().memory_bytes, 70);
+    assert_eq!(scheduler.available().memory_bytes, 30);
     assert_eq!(
         scheduler
             .reserve(ResourceRequest {
@@ -67,4 +68,23 @@ fn concurrent_reservations_cannot_cross_the_limit() {
         .filter_map(|thread| thread.join().unwrap())
         .collect();
     assert_eq!(reservations.len(), 1);
+}
+
+#[test]
+fn compares_a_request_with_a_live_capacity_snapshot() {
+    let request = Capacity {
+        memory_bytes: 64,
+        cpu_millis: 500,
+        pids: 8,
+    };
+    assert!(request.fits_within(Capacity {
+        memory_bytes: 64,
+        cpu_millis: 500,
+        pids: 8,
+    }));
+    assert!(!request.fits_within(Capacity {
+        memory_bytes: 63,
+        cpu_millis: 500,
+        pids: 8,
+    }));
 }

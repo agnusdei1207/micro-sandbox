@@ -8,7 +8,7 @@ import type {
 interface PendingRequest {
   readonly resolve: (result: unknown) => void;
   readonly reject: (error: Error) => void;
-  readonly removeAbort?: () => void;
+  readonly removeAbort: (() => void) | undefined;
 }
 
 export class SupervisorClient {

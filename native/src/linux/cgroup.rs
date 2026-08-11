@@ -2,7 +2,9 @@ use crate::config::ResourceLimits;
 use crate::error::SandboxError;
 use std::fs;
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
 const PERIOD_MICROS: u64 = 100_000;
@@ -67,6 +69,33 @@ impl Cgroup {
         self.write("cgroup.procs", &pid.to_string())
     }
 
+    pub fn open_fd(&self) -> Result<OwnedFd, SandboxError> {
+        let path = std::ffi::CString::new(self.path.as_os_str().as_encoded_bytes())
+            .map_err(|_| SandboxError::PolicyViolation("cgroup path contains NUL".into()))?;
+        // SAFETY: path is NUL-terminated and flags request a new directory descriptor.
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd == -1 {
+            return Err(SandboxError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: open returned a new owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    pub fn kill_all(&self) -> Result<(), SandboxError> {
+        self.write("cgroup.kill", "1")
+    }
+
+    pub fn memory_peak_bytes(&self) -> Option<u64> {
+        fs::read_to_string(self.path.join("memory.peak"))
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    }
+
     pub fn cleanup(&mut self) -> Result<(), SandboxError> {
         if self.cleaned {
             return Ok(());
@@ -76,7 +105,7 @@ impl Cgroup {
             return Ok(());
         }
 
-        let kill_result = self.write("cgroup.kill", "1");
+        let kill_result = self.kill_all();
         if self.mode == CgroupMode::Emulated {
             for entry in fs::read_dir(&self.path)? {
                 let path = entry?.path();
@@ -85,7 +114,20 @@ impl Cgroup {
                 }
             }
         }
-        fs::remove_dir(&self.path)?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match fs::remove_dir(&self.path) {
+                Ok(()) => break,
+                Err(error)
+                    if self.mode == CgroupMode::Kernel
+                        && matches!(error.raw_os_error(), Some(libc::EBUSY))
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(SandboxError::Io(error)),
+            }
+        }
         self.cleaned = true;
         kill_result
     }

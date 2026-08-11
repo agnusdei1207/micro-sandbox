@@ -1,49 +1,71 @@
 {
   "name": "micro-sandbox",
   "version": "0.0.1",
+  "description": "Fail-closed Linux sandbox for running untrusted commands from Node.js",
   "type": "module",
-  "description": "Zero-dependency, ultra-fast in-process Linux micro-sandbox & Content Disarm and Reconstruction (CDR) library for Node.js.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE",
+    "docs/ARCHITECTURE.md",
+    "docs/ARCHITECTURE.ko.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "clean": "node scripts/clean.mjs",
+    "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test test/*.spec.ts",
-    "prepublishOnly": "npm run build"
+    "test:native": "node scripts/native.mjs test",
+    "test:kernel": "node scripts/native.mjs kernel",
+    "test:integration": "npm run build && node scripts/native.mjs integration",
+    "build:native": "node scripts/build-native.mjs",
+    "build:native:docker": "node scripts/build-platforms.mjs",
+    "package:verify": "node scripts/verify-package.mjs",
+    "check": "npm run test && npm run test:native && npm audit --audit-level=moderate",
+    "prepack": "npm run clean && npm run build && node scripts/verify-package.mjs --source-only"
+  },
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "optionalDependencies": {
+    "micro-sandbox-linux-arm64": "0.0.1",
+    "micro-sandbox-linux-x64": "0.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/agnusdei1207/micro-sandbox.git"
   },
+  "homepage": "https://github.com/agnusdei1207/micro-sandbox#readme",
+  "bugs": {
+    "url": "https://github.com/agnusdei1207/micro-sandbox/issues"
+  },
   "keywords": [
     "sandbox",
-    "cdr",
-    "security",
-    "file-upload",
+    "linux-sandbox",
+    "untrusted-code",
+    "process-isolation",
     "linux-namespaces",
-    "cgroups",
-    "zero-dependency",
-    "nodejs"
+    "cgroup-v2",
+    "seccomp",
+    "container-security",
+    "nodejs",
+    "rust"
   ],
   "author": "agnusdei1207",
   "license": "MIT",
-  "dependencies": {
-    "cheerio": "^1.0.0-rc.12",
-    "sanitize-html": "^2.12.0",
-    "sharp": "^0.33.2"
-  },
-  "devDependencies": {
-    "@types/node": "^20.11.0",
-    "@types/sanitize-html": "^2.9.5",
-    "typescript": "^5.3.3"
+  "publishConfig": {
+    "access": "public"
   }
 }

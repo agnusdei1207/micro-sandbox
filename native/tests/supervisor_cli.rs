@@ -4,6 +4,9 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn supervisor_answers_health_and_exits_on_shutdown() {
+    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
+        return;
+    }
     let mut child = Command::new(env!("CARGO_BIN_EXE_micro-sandbox"))
         .arg("supervise")
         .stdin(Stdio::piped())
@@ -37,5 +40,5 @@ fn supervisor_answers_health_and_exits_on_shutdown() {
     assert_eq!(responses[0]["result"]["status"], "ready");
     assert_eq!(responses[0]["result"]["protocolVersion"], 1);
     assert_eq!(responses[1]["id"], 2);
-    assert_eq!(responses[1]["result"]["status"], "closing");
+    assert_eq!(responses[1]["result"]["status"], "closed");
 }

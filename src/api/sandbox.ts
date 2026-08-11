@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { SandboxError } from '../errors.js';
 import { resolveSupervisorBinary } from '../platform/binary.js';
+import { resolveSupervisorEnvironment } from '../platform/environment.js';
 import { normalizeGuestPath } from '../policy/paths.js';
 import { resolvePolicy } from '../policy/resolve.js';
 import { SupervisorClient } from '../supervisor/client.js';
@@ -8,6 +10,8 @@ import type {
   CapacityOptions,
   JobRequest,
   JobResult,
+  ProfileDefinition,
+  ResolvedProfile,
   RuntimeDefinition,
   SandboxOptions,
   SupervisorRequester,
@@ -21,6 +25,11 @@ interface QueueEntry {
   readonly request: JobRequest;
   readonly resolve: (result: JobResult) => void;
   readonly reject: (error: Error) => void;
+}
+
+interface WireJobResult extends Omit<JobResult, 'stdout' | 'stderr'> {
+  readonly stdoutBase64: string;
+  readonly stderrBase64: string;
 }
 
 const DEFAULT_CAPACITY: Readonly<CapacityOptions> = Object.freeze({
@@ -38,7 +47,7 @@ export class Sandbox implements AsyncDisposable {
   private active = 0;
   private closing = false;
   private closePromise?: Promise<void>;
-  private resolveClose?: () => void;
+  private resolveClose: (() => void) | undefined;
 
   constructor(
     private readonly options: SandboxOptions = {},
@@ -86,6 +95,16 @@ export class Sandbox implements AsyncDisposable {
     return this.runtimes.register(definition);
   }
 
+  defineProfile(name: string, definition: ProfileDefinition): Readonly<ResolvedProfile> {
+    if (this.requesterPromise) {
+      throw new SandboxError(
+        'POLICY_VIOLATION',
+        'Profiles must be defined before the supervisor starts',
+      );
+    }
+    return this.profiles.define(name, definition);
+  }
+
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
@@ -112,14 +131,38 @@ export class Sandbox implements AsyncDisposable {
   private async execute(entry: QueueEntry): Promise<void> {
     try {
       const requester = await this.getRequester();
-      const policy = resolvePolicy(this.options, entry.request.limits);
-      const { signal, ...request } = entry.request;
-      const result = await requester.request<JobResult>(
+      const profileLimits = entry.request.profile
+        ? this.profiles.get(entry.request.profile).limits
+        : {};
+      const policy = resolvePolicy(this.options, {
+        ...profileLimits,
+        ...entry.request.limits,
+      });
+      const runtime = entry.request.runtime
+        ? this.runtimes.get(entry.request.runtime)
+        : undefined;
+      const command = entry.request.command ?? runtime?.entrypoint;
+      if (!command) {
+        throw new SandboxError(
+          'POLICY_VIOLATION',
+          'A command or a runtime with an entrypoint is required',
+        );
+      }
+      const result = await requester.request<WireJobResult>(
         'run',
-        { ...request, args: [...(request.args ?? [])], policy },
-        signal,
+        {
+          jobId: `job-${randomUUID().replaceAll('-', '')}`,
+          rootfs: runtime?.rootfs ?? this.options.rootfs ?? '/',
+          command,
+          args: [...(entry.request.args ?? [])],
+          cwd: entry.request.cwd ?? '/',
+          env: { ...entry.request.env },
+          stdinBase64: Buffer.from(entry.request.stdin ?? '').toString('base64'),
+          limits: policy.limits,
+        },
+        entry.request.signal,
       );
-      entry.resolve(result);
+      entry.resolve(decodeResult(result));
     } catch (error) {
       entry.reject(error instanceof Error ? error : new Error(String(error)));
     } finally {
@@ -151,19 +194,37 @@ export async function createSandbox(options: SandboxOptions = {}): Promise<Sandb
 
 function defaultRequesterFactory(options: SandboxOptions): RequesterFactory {
   return async () => {
-    const binary = resolveSupervisorBinary({
-      override: options.supervisorBinary ?? process.env.MICRO_SANDBOX_BINARY,
-    });
-    return new SupervisorClient(new ChildProcessTransport(binary));
+    const override = options.supervisorBinary ?? process.env.MICRO_SANDBOX_BINARY;
+    const binary = resolveSupervisorBinary(override ? { override } : {});
+    return new SupervisorClient(
+      new ChildProcessTransport(binary, resolveSupervisorEnvironment(options)),
+    );
   };
 }
 
 function validateRequest(request: JobRequest): void {
-  normalizeGuestPath(request.command);
+  if (!request.command && !request.runtime) {
+    throw new SandboxError(
+      'POLICY_VIOLATION',
+      'A command or registered runtime is required',
+    );
+  }
+  if (request.command) normalizeGuestPath(request.command);
   if (request.cwd) normalizeGuestPath(request.cwd);
-  for (const path of Object.keys(request.files ?? {})) normalizeGuestPath(path);
-  for (const path of request.outputs ?? []) normalizeGuestPath(path);
   if (request.args?.some((argument) => argument.includes('\0'))) {
     throw new SandboxError('POLICY_VIOLATION', 'Command arguments may not contain NUL');
   }
+}
+
+function decodeResult(result: WireJobResult): JobResult {
+  return Object.freeze({
+    exitCode: result.exitCode,
+    signal: result.signal,
+    timedOut: result.timedOut,
+    outputLimitExceeded: result.outputLimitExceeded,
+    stdout: Buffer.from(result.stdoutBase64, 'base64'),
+    stderr: Buffer.from(result.stderrBase64, 'base64'),
+    isolation: Object.freeze({ ...result.isolation }),
+    metrics: Object.freeze({ ...result.metrics }),
+  });
 }

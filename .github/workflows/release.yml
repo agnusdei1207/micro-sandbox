@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  platform:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          registry-url: https://registry.npmjs.org
+      - run: rustup toolchain install 1.97.1 --profile minimal
+      - run: rustup default 1.97.1
+      - run: npm ci
+      - run: npm run build:native
+      - run: npm run package:verify -- --current=${{ matrix.arch }}
+      - run: mkdir -p artifacts
+      - run: npm pack ./npm/linux-${{ matrix.arch }} --pack-destination artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: platform-${{ matrix.arch }}
+          path: artifacts/*.tgz
+
+  publish:
+    needs: platform
+    runs-on: ubuntu-24.04
+    environment: npm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.18.0
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: platform-*
+          path: artifacts
+          merge-multiple: true
+      - run: npm ci
+      - run: npm test
+      - run: npm publish artifacts/micro-sandbox-linux-x64-*.tgz --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish artifacts/micro-sandbox-linux-arm64-*.tgz --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
