@@ -1,0 +1,147 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { Sandbox } from '../dist/api/sandbox.js';
+import { SandboxError } from '../dist/errors.js';
+import type { JobResult, SupervisorRequester } from '../dist/types.js';
+
+function successfulResult(stdout = ''): JobResult {
+  return {
+    exitCode: 0,
+    signal: null,
+    stdout: Buffer.from(stdout),
+    stderr: Buffer.alloc(0),
+    files: {},
+    isolation: {
+      namespaces: ['user', 'pid', 'mount', 'network', 'ipc', 'uts', 'cgroup'],
+      network: 'none',
+      cgroupV2: true,
+      seccomp: true,
+      noNewPrivileges: true,
+      dropCapabilities: true,
+    },
+    metrics: { durationMs: 1, peakMemoryBytes: 0, cpuTimeMs: 0 },
+  };
+}
+
+class ControlledRequester implements SupervisorRequester {
+  readonly calls: Array<{ type: string; payload: unknown; signal?: AbortSignal }> = [];
+  readonly completions: Array<(result: JobResult) => void> = [];
+  closed = false;
+
+  request<T>(type: string, payload: unknown, signal?: AbortSignal): Promise<T> {
+    this.calls.push({ type, payload, signal });
+    return new Promise<T>((resolve, reject) => {
+      this.completions.push(resolve as (result: JobResult) => void);
+      signal?.addEventListener(
+        'abort',
+        () => reject(new SandboxError('CANCELLED', 'cancelled')),
+        { once: true },
+      );
+    });
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+}
+
+test('Sandbox starts its supervisor lazily and decodes a run result', async () => {
+  const requester = new ControlledRequester();
+  let starts = 0;
+  const sandbox = new Sandbox({}, async () => {
+    starts += 1;
+    return requester;
+  });
+
+  assert.equal(starts, 0);
+  const pending = sandbox.run({ command: '/app/echo', args: ['hello'] });
+  assert.equal(starts, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  requester.completions[0](successfulResult('hello'));
+
+  assert.equal((await pending).stdout.toString('utf8'), 'hello');
+  assert.equal(requester.calls[0].type, 'run');
+  await sandbox.close();
+});
+
+test('Sandbox admits queued jobs in FIFO order', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox(
+    { capacity: { maxInFlight: 1, maxQueue: 2, overload: 'wait' } },
+    async () => requester,
+  );
+
+  const first = sandbox.run({ command: '/app/task', args: ['1'] });
+  const second = sandbox.run({ command: '/app/task', args: ['2'] });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requester.calls.length, 1);
+
+  requester.completions[0](successfulResult('1'));
+  assert.equal((await first).stdout.toString(), '1');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requester.calls.length, 2);
+  assert.deepEqual((requester.calls[1].payload as { args: string[] }).args, ['2']);
+  requester.completions[1](successfulResult('2'));
+  await second;
+  await sandbox.close();
+});
+
+test('Sandbox rejects overload beyond the bounded queue', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox(
+    { capacity: { maxInFlight: 1, maxQueue: 1, overload: 'reject' } },
+    async () => requester,
+  );
+
+  const first = sandbox.run({ command: '/app/task' });
+  const second = sandbox.run({ command: '/app/task' });
+  await assert.rejects(
+    sandbox.run({ command: '/app/task' }),
+    (error: unknown) => error instanceof SandboxError && error.code === 'CAPACITY_EXCEEDED',
+  );
+  requester.completions[0](successfulResult());
+  await first;
+  await new Promise((resolve) => setImmediate(resolve));
+  requester.completions[1](successfulResult());
+  await second;
+  await sandbox.close();
+});
+
+test('Sandbox rejects new jobs after close starts and drains active work', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({}, async () => requester);
+  const active = sandbox.run({ command: '/app/task' });
+  const closing = sandbox.close();
+
+  await assert.rejects(
+    sandbox.run({ command: '/app/task' }),
+    (error: unknown) => error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
+  );
+  assert.equal(requester.closed, false);
+  requester.completions[0](successfulResult());
+  await active;
+  await closing;
+  assert.equal(requester.closed, true);
+});
+
+test('Sandbox close waits for the supervisor transport to finish closing', async () => {
+  let releaseClose!: () => void;
+  const requester: SupervisorRequester = {
+    request: async () => successfulResult(),
+    close: () => new Promise<void>((resolve) => {
+      releaseClose = resolve;
+    }),
+  };
+  const sandbox = new Sandbox({}, async () => requester);
+  await sandbox.run({ command: '/app/task' });
+
+  let closed = false;
+  const closing = sandbox.close().then(() => {
+    closed = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closed, false);
+  releaseClose();
+  await closing;
+  assert.equal(closed, true);
+});

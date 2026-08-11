@@ -3,6 +3,7 @@ import { load } from 'cheerio';
 import sanitizeHtml from 'sanitize-html';
 import sharp from 'sharp';
 
+export { createSandbox } from './api/sandbox.js';
 export { SandboxError } from './errors.js';
 export { normalizeGuestPath } from './policy/paths.js';
 export { DEFAULT_CEILINGS, DEFAULT_LIMITS, resolvePolicy } from './policy/resolve.js';
@@ -10,6 +11,9 @@ export { resolveSupervisorBinary } from './platform/binary.js';
 export { SupervisorClient } from './supervisor/client.js';
 export type {
   IsolationPolicy,
+  JobRequest,
+  JobResult,
+  RuntimeDefinition,
   ResolvedPolicy,
   ResourceLimits,
   SandboxOptions,
