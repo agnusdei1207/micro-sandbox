@@ -1,0 +1,44 @@
+{
+  "name": "micro-sandbox",
+  "version": "0.1.0",
+  "description": "Zero-dependency, ultra-fast in-process Linux micro-sandbox & Content Disarm and Reconstruction (CDR) library for Node.js.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agnusdei1207/micro-sandbox.git"
+  },
+  "keywords": [
+    "sandbox",
+    "cdr",
+    "security",
+    "file-upload",
+    "linux-namespaces",
+    "cgroups",
+    "zero-dependency",
+    "nodejs"
+  ],
+  "author": "agnusdei1207",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/agnusdei1207/micro-sandbox/issues"
+  },
+  "homepage": "https://github.com/agnusdei1207/micro-sandbox#readme",
+  "dependencies": {
+    "cheerio": "^1.0.0-rc.12",
+    "sanitize-html": "^2.12.0",
+    "sharp": "^0.33.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/sanitize-html": "^2.9.5",
+    "typescript": "^5.3.3"
+  }
+}
