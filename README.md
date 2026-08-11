@@ -5,11 +5,11 @@ Fail-closed Linux process isolation for Node.js. Untrusted commands run with use
 Requires Node.js 24.18+ LTS and Linux 5.15+ at runtime (x64 or ARM64). Development and unit tests work on Windows.
 
 ```bash
-npm install micro-sandbox
+npm install @agnusdei12071207/micro-sandbox
 ```
 
 ```js
-import { createSandbox } from 'micro-sandbox';
+import { createSandbox } from '@agnusdei12071207/micro-sandbox';
 
 await using sandbox = await createSandbox({
   cgroupRoot: '/sys/fs/cgroup/my-service/sandbox',

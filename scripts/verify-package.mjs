@@ -10,7 +10,7 @@ const packages = [
 ];
 
 const root = JSON.parse(await readFile('package.json', 'utf8'));
-assert(root.name === 'micro-sandbox', 'main package name');
+assert(root.name === '@agnusdei12071207/micro-sandbox', 'main package name');
 assert(root.version === VERSION, 'main package version');
 assert(root.engines?.node === '>=24.18.0', 'Node LTS engine');
 assert(root.type === 'module', 'ESM package type');

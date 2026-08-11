@@ -10,7 +10,7 @@ const artifacts = path.resolve('artifacts');
 await mkdir(artifacts, { recursive: true });
 const platformTarball = pack(`./npm/linux-${arch}`);
 const rootTarball = pack('.');
-const probe = "import { createSandbox } from 'micro-sandbox'; import { access } from 'node:fs/promises'; import { createRequire } from 'node:module'; const require=createRequire(import.meta.url); await access(require.resolve('micro-sandbox-linux-" + arch + "/bin/micro-sandbox')); if(typeof createSandbox!=='function') process.exit(1);";
+const probe = "import { createSandbox } from '@agnusdei12071207/micro-sandbox'; import { access } from 'node:fs/promises'; import { createRequire } from 'node:module'; const require=createRequire(import.meta.url); await access(require.resolve('micro-sandbox-linux-" + arch + "/bin/micro-sandbox')); if(typeof createSandbox!=='function') process.exit(1);";
 if (process.platform === 'linux') {
   const project = await mkdtemp(path.join(tmpdir(), 'micro-sandbox-smoke-'));
   await writeFile(path.join(project, 'package.json'), JSON.stringify({ private: true, type: 'module' }));

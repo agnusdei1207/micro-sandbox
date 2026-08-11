@@ -1,5 +1,5 @@
 {
-  "name": "micro-sandbox",
+  "name": "@agnusdei12071207/micro-sandbox",
   "version": "0.0.1",
   "description": "Fail-closed Linux sandbox for running untrusted commands from Node.js",
   "type": "module",
