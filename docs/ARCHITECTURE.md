@@ -57,7 +57,7 @@ The seccomp denylist is defense in depth around namespaces, capabilities, mounts
 
 Extension is composition: register any caller-owned root and entrypoint, then run it under the same non-disableable controls. Image re-encoding can call ImageMagick; code execution can call Node, Python, a compiler, or a custom program. The package itself has no parser, sanitizer, S3 adapter, or runtime dependency.
 
-Version 0.0.1 intentionally exposes only bounded stdin/stdout/stderr. Arbitrary artifact recovery requires a separately designed, verified data plane.
+The public API intentionally exposes only bounded stdin/stdout/stderr. Arbitrary artifact recovery requires a separately designed, verified data plane.
 
 ## Deployment and release
 

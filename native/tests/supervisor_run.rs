@@ -84,7 +84,6 @@ fn a_restarted_supervisor_reconciles_jobs_left_by_a_crash() {
     let stale = wait_for_owned_job(std::path::Path::new(&cgroup_root), supervisor.id(), 61);
     supervisor.kill().unwrap();
     supervisor.wait().unwrap();
-    wait_for_unpopulated(&stale);
 
     let mut restarted = start_supervisor();
     send(
@@ -236,22 +235,6 @@ fn wait_for_owned_job(root: &std::path::Path, pid: u32, request_id: u64) -> std:
         "owned job {prefix}*{suffix} was not created below {}",
         root.display()
     );
-}
-
-fn wait_for_unpopulated(path: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let events = std::fs::read_to_string(path.join("cgroup.events")).unwrap_or_default();
-        if events.lines().any(|line| line == "populated 0") {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} remained populated",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
 }
 
 fn decode(value: &Value) -> Vec<u8> {

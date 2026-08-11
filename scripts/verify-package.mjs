@@ -2,7 +2,7 @@ import { access, readFile, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import process from 'node:process';
 
-const VERSION = '0.0.1';
+const VERSION = '0.0.2';
 const current = process.argv.find((argument) => argument.startsWith('--current='))?.split('=')[1];
 const packages = [
   { directory: 'npm/linux-x64', name: 'micro-sandbox-linux-x64', cpu: 'x64', machine: 0x3e },

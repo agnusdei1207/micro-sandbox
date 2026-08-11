@@ -14,10 +14,23 @@ publishUnlessPresent(root.name, '.');
 
 function publishUnlessPresent(name, target) {
   if (run(['view', `${name}@${root.version}`, 'version'], true).status === 0) return;
-  const result = run(['publish', target, '--access', 'public', '--provenance'], false);
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  const result = run(['publish', target, '--access', 'public', '--provenance'], true);
+  process.stdout.write(result.stdout ?? '');
+  process.stderr.write(result.stderr ?? '');
+  if (result.status === 0 || alreadyPublished(result)) return;
+  process.exit(result.status ?? 1);
 }
 
 function run(args, quiet) {
-  return spawnSync('npm', args, { stdio: quiet ? 'ignore' : 'inherit', shell: false });
+  return spawnSync('npm', args, {
+    encoding: 'utf8',
+    stdio: quiet ? 'pipe' : 'inherit',
+    shell: false,
+  });
+}
+
+function alreadyPublished(result) {
+  return /previously published versions|cannot publish over/i.test(
+    `${result.stdout ?? ''}\n${result.stderr ?? ''}`,
+  );
 }

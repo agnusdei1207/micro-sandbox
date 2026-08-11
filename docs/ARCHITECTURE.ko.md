@@ -57,7 +57,7 @@ Seccomp denylist는 namespace·capability·mount·cgroup 경계를 보강하는 
 
 확장은 조합으로 처리합니다. 호출자가 원하는 root와 entrypoint를 등록하면 같은 비활성화 불가능한 제어 아래에서 실행됩니다. 이미지 재인코딩은 ImageMagick, 코드 실행은 Node·Python·컴파일러·사용자 실행 파일을 호출할 수 있습니다. 패키지 자체에는 parser, sanitizer, S3 adapter, 런타임 의존성이 없습니다.
 
-0.0.1은 제한된 stdin/stdout/stderr만 제공합니다. 임의 artifact 회수는 별도로 설계하고 검증한 data plane이 필요합니다.
+공개 API는 의도적으로 제한된 stdin/stdout/stderr만 제공합니다. 임의 artifact 회수는 별도로 설계하고 검증한 data plane이 필요합니다.
 
 ## 배포와 릴리스
 

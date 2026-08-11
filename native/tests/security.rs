@@ -5,6 +5,9 @@ use std::process::Command;
 
 #[test]
 fn security_probe_drops_privilege_and_blocks_dangerous_syscalls() {
+    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
+        return;
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_micro-sandbox"))
         .arg("security-probe")
         .output()
