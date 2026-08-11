@@ -1,15 +1,23 @@
 {
   "name": "micro-sandbox",
   "version": "0.1.0",
+  "type": "module",
   "description": "Zero-dependency, ultra-fast in-process Linux micro-sandbox & Content Disarm and Reconstruction (CDR) library for Node.js.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test test/*.spec.ts",
+    "test": "tsc && node --test test/*.spec.js",
     "prepublishOnly": "npm run build"
   },
   "repository": {

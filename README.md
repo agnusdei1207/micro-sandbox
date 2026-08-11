@@ -7,7 +7,7 @@
 
 ---
 
-## 📌 Features
+## 📌 Key Features
 
 - ⚡ **Zero External Infrastructure**: Docker, Compose, Kubernetes, or AWS Lambda dependencies = **0**.
 - 🚀 **Sub-millisecond Speed**: Spins up an in-process sandbox in **< 1ms** using native Linux Kernel Syscalls (`CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWNS`).
@@ -17,6 +17,44 @@
   - **Text/Files**: Strict UTF-8 fatal decoding + null-byte detection.
   - **DOM/HTML**: 2-Pass DOM sanitization with Dynamic Content-Security-Policy (CSP) meta injection.
 - 🔒 **Zero-Trust Storage Pipeline**: Sandbox never holds AWS credentials. Clean assets are returned to the main process for S3 upload.
+
+---
+
+## 💻 Installation
+
+```bash
+npm install micro-sandbox
+# or
+pnpm add micro-sandbox
+```
+
+---
+
+## 🚀 Quick Usage
+
+```typescript
+import { sanitizeFile } from 'micro-sandbox';
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+
+// 1. Sanitize raw file stream in 0.001s using sandboxed CDR
+const result = await sanitizeFile(rawFileBuffer, {
+  mimeType: 'image/jpeg',
+  outputFormat: 'webp', // Re-encode pure pixels into WebP and strip EXIF
+  timeoutMs: 5000,
+});
+
+console.log(result.sanitized); // true
+console.log(result.mimeType);  // "image/webp"
+
+// 2. Upload only sanitized clean asset to S3
+const s3 = new S3Client({});
+await s3.send(new PutObjectCommand({
+  Bucket: 'my-clean-assets-bucket',
+  Key: 'user-files/sanitized-photo.webp',
+  Body: result.buffer,
+  ContentType: result.mimeType,
+}));
+```
 
 ---
 
@@ -43,12 +81,6 @@
 │  [ PutObject to Main S3 Storage ]                                       │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
-
----
-
-## 📄 Patent Specification & Documentation
-
-Detailed patent specifications and claims (Claim 1~4) can be found in the documentation.
 
 ---
 
