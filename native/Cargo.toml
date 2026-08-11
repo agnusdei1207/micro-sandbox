@@ -1,0 +1,26 @@
+[package]
+name = "micro-sandbox-native"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "micro-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

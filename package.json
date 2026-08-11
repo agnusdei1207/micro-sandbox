@@ -1,6 +1,6 @@
 {
   "name": "micro-sandbox",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "description": "Zero-dependency, ultra-fast in-process Linux micro-sandbox & Content Disarm and Reconstruction (CDR) library for Node.js.",
   "main": "dist/index.js",

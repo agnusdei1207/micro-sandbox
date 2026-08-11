@@ -2,7 +2,7 @@
 
 ## 목적
 
-`micro-sandbox`는 npm으로 배포되는 범용 Linux 프로세스 샌드박스다. 신뢰할 수 없는 명령, 코드, 파일 처리기를 커널로 격리된 일회성 작업에서 실행한다. 파일 sanitizing은 핵심 추상화가 아니라 내장 preset이다.
+`micro-sandbox`는 npm으로 배포되는 범용 Linux 프로세스 샌드박스다. 신뢰할 수 없는 명령, 코드, 파일 처리기를 커널로 격리된 일회성 작업에서 실행한다. 형식별 parser, 저장소 adapter, cloud integration은 포함하지 않는다.
 
 지원 호스트:
 
@@ -48,7 +48,7 @@ const result = await sandbox.run({
 });
 ```
 
-같은 primitive로 네이티브 도구, 등록된 Node/Python runtime, 컴파일, 미디어 변환, sanitizing preset을 실행한다.
+같은 primitive로 네이티브 도구, 등록된 Node/Python runtime, 컴파일, 미디어 변환, 사용자가 제공한 sanitizer를 실행한다.
 
 ## 설정
 
@@ -114,7 +114,7 @@ Node client는 heartbeat를 감시한다. Supervisor가 종료되면 활성 작�
 
 등록 runtime은 불변 rootfs 또는 bundle, entrypoint, digest, 기본 profile, 허용 환경변수 키를 정의한다. 작업 profile은 내장 profile을 상속하며 hard deny 목록 안에서 제한을 조정하거나 검토된 syscall을 추가할 수 있다. 사용자 요청은 runtime, 실행 파일 경로, mount, seccomp 정책을 등록할 수 없다.
 
-내장 profile은 strict native 실행, interpreted code, compilation, media processing, sanitizing을 제공한다. Sanitizing preset은 파일명과 선언 MIME을 독립적으로 검증하고, 형식별 decoding과 reconstruction을 적용하며, 미지원 또는 불일치 입력을 거부한다.
+내장 profile은 strict native 실행, interpreted code, compilation, media processing을 제공한다. Recipe는 sanitizer나 transcoder 등록 방법을 보여주되 parser, 형식 정책, 저장 위치를 핵심 패키지에 포함하지 않는다.
 
 ## 오류와 관측성
 
@@ -126,7 +126,7 @@ API는 `CAPACITY_EXCEEDED`, `POLICY_VIOLATION`, `ISOLATION_UNAVAILABLE`, `TIMEOU
 
 JavaScript 패키지는 Linux x86-64 또는 ARM64용 optional platform package에서 바이너리를 선택한다. 미지원 플랫폼은 초기화 단계에서 명확한 진단으로 실패한다.
 
-npm manifest와 README는 짧고 일관된 description과 핵심 검색어를 사용한다: `sandbox`, `linux-sandbox`, `nodejs-sandbox`, `process-isolation`, `untrusted-code`, `cgroups`, `namespaces`, `seccomp`, `file-upload-security`, `cdr`. Repository, homepage, issues, engines, OS, CPU, license, provenance metadata를 정확하게 유지한다. GitHub topics는 주요 npm keyword와 맞춘다.
+npm manifest와 README는 짧고 일관된 description과 핵심 검색어를 사용한다: `sandbox`, `linux-sandbox`, `nodejs-sandbox`, `process-isolation`, `untrusted-code`, `cgroups`, `namespaces`, `seccomp`, `resource-limits`, `rootless`. Repository, homepage, issues, engines, OS, CPU, license, provenance metadata를 정확하게 유지한다. GitHub topics는 주요 npm keyword와 맞춘다.
 
 ## 검증 게이트
 

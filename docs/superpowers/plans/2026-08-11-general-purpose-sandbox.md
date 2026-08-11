@@ -2,15 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the misleading in-process sanitizer with a fail-closed, general-purpose Linux sandbox distributed through npm for Linux 5.15+ on x86-64 and ARM64.
+**Goal:** Replace the misleading in-process sanitizer with a fail-closed, general-purpose Linux sandbox distributed through npm for Linux 5.15+ on x86-64 and ARM64, without format or storage coupling.
 
-**Architecture:** A typed TypeScript client owns a long-lived Rust supervisor child. The supervisor performs admission control and creates a disposable namespace/cgroup/seccomp-isolated process for every job. Sanitization is a preset built on the same job API.
+**Architecture:** A typed TypeScript client owns a long-lived Rust supervisor child. The supervisor performs admission control and creates a disposable namespace/cgroup/seccomp-isolated process for every job. Users compose arbitrary tools and runtimes on the same minimal job API.
 
-**Tech Stack:** TypeScript/Node.js 20+, Rust 2021, Tokio, serde, libc/nix, cgroup v2, clone3, seccomp BPF, Node test runner, Cargo tests, GitHub Actions, npm platform packages.
+**Tech Stack:** TypeScript/Node.js 24.18+ LTS, Rust 1.97+ with Edition 2024, serde, libc, cgroup v2, clone3, seccomp BPF, Node test runner, Cargo tests, GitHub Actions, npm platform packages.
 
 ## Global Constraints
 
 - Support only Linux kernel 5.15+ on x86-64 and ARM64.
+- Use Node.js 24.18+ LTS and Rust 1.97+ with Edition 2024; follow latest stable/LTS releases for development and CI.
+- Publish the initial completed release as 0.0.1 and use patch-only versions for subsequent fixes.
 - Fail closed when mandatory isolation is unavailable; never claim fallback isolation.
 - Keep core security controls non-disableable while allowing safe defaults, ceilings, profiles, runtimes, and job overrides.
 - Keep files focused by responsibility and remove obsolete implementation paths.
@@ -129,22 +131,21 @@
 - [ ] Run TypeScript and Rust suites plus repeated-run leak tests.
 - [ ] Commit with `feat: execute and recover sandbox jobs`.
 
-### Task 8: Extensible sanitization pipeline and compatibility cleanup
+### Task 8: Remove format coupling and provide composable recipes
 
 **Files:**
-- Create: `src/presets/sanitize/index.ts`, `src/presets/sanitize/types.ts`, `src/presets/sanitize/registry.ts`, `src/presets/sanitize/text.ts`, `src/presets/sanitize/html.ts`, `src/presets/sanitize/image.ts`, `src/presets/sanitize/svg.ts`, `src/presets/sanitize/pdf.ts`, `src/presets/sanitize/office.ts`, `src/presets/sanitize/archive.ts`, `src/presets/sanitize/detect.ts`, `src/presets/sanitize/budgets.ts`
-- Create: `test/sanitize.spec.ts`
-- Delete obsolete logic from: `src/index.ts`
+- Create: `examples/reencode-image.mjs`, `examples/run-script.mjs`, `test/examples.spec.ts`
+- Delete obsolete sanitizer logic from: `src/index.ts`
 - Modify: `package.json`
 
 **Interfaces:**
-- Preserves `sanitizeFile()`, `sanitizeText()`, `sanitizeHtmlDocument()`, and `sanitizeImage()` while routing unsafe parsers through the sandbox preset on supported hosts. Produces `SanitizationReport` with the detected type, strategy, fidelity loss, guarantees, warnings, and recursively processed entries.
+- Keeps the core API limited to generic jobs, runtimes, profiles, files, streams, limits, cancellation, and results. Examples demonstrate composition without adding parser or storage dependencies.
 
-- [ ] Write compatibility and hostile-input tests for MIME mismatch, malformed UTF-8, active HTML/SVG, image and decompression bombs, PDF JavaScript/actions/attachments, macro-enabled Office documents, OLE/external links, archive traversal, recursive archives, entry-count/expanded-size/ratio/depth budgets, and fail-closed isolation.
-- [ ] Verify failures against the old implementation.
-- [ ] Implement a processor registry with safe built-ins and operator-supplied processors registered only at startup. Re-encode raster images from decoded pixels; support animated frame budgets; rasterize SVG by default with strict structural mode as an explicit lower-guarantee option; rasterize PDF pages into a fresh image-only PDF; reject macro Office formats by default and allow sandboxed PDF conversion; recursively sanitize archives with normalized paths and hard budgets. Move pure validation into focused modules, remove fake `unshare --help` isolation, remove non-isolated fallback, and connect every parser to the sandbox API.
-- [ ] Run the complete suite and scan for obsolete exports and dead dependencies.
-- [ ] Commit with `refactor: rebuild sanitization on sandbox jobs`.
+- [ ] Write tests that run the example request builders without S3, MIME, image, PDF, Office, archive, or sanitizer imports in the core package.
+- [ ] Verify the tests fail while the old coupled API and dependencies remain.
+- [ ] Remove `sanitizeFile()`, `sanitizeText()`, `sanitizeHtmlDocument()`, `sanitizeImage()`, `sharp`, `cheerio`, and `sanitize-html`; add small examples that register a caller-owned reencoder or script runtime and execute it through `sandbox.run()`.
+- [ ] Run the complete suite, `npm audit`, and scans for obsolete exports, parser code, cloud assumptions, and dead dependencies.
+- [ ] Commit with `refactor: focus package on sandbox execution`.
 
 ### Task 9: Platform packaging, CI, and release metadata
 

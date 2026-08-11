@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`micro-sandbox` is a general-purpose Linux process sandbox distributed as an npm package. It runs untrusted commands, code, and file processors in disposable kernel-isolated jobs. File sanitization is a built-in preset, not the core abstraction.
+`micro-sandbox` is a general-purpose Linux process sandbox distributed as an npm package. It runs untrusted commands, code, and file processors in disposable kernel-isolated jobs. It contains no format-specific parser, storage adapter, or cloud integration.
 
 Supported hosts:
 
@@ -48,7 +48,7 @@ const result = await sandbox.run({
 });
 ```
 
-The same primitive supports native tools, registered Node or Python runtimes, compilation, media conversion, and sanitization presets.
+The same primitive supports native tools, registered Node or Python runtimes, compilation, media conversion, and user-supplied sanitizers.
 
 ## Configuration
 
@@ -114,7 +114,7 @@ Extensions are isolated executables, never dynamic libraries loaded into the sup
 
 A registered runtime specifies an immutable rootfs or bundle, entrypoint, digest, base profile, and allowed environment keys. A task profile derives from a built-in profile and may adjust limits or add reviewed syscalls within a hard deny set. User-controlled requests cannot register runtimes, executable paths, mounts, or seccomp policies.
 
-Built-in profiles cover strict native execution, interpreted code, compilation, media processing, and sanitization. The sanitization preset detects content independently of filenames and declared MIME types, applies format-specific decoding and reconstruction, and rejects unsupported or mismatched input.
+Built-in profiles cover strict native execution, interpreted code, compilation, and media processing. Recipes demonstrate how to register a sanitizer or transcoder without making its parser, format policy, or storage destination part of the core package.
 
 ## Errors and observability
 
@@ -126,7 +126,7 @@ Results expose exit status, bounded stdout/stderr, declared output files, applie
 
 The JavaScript package selects a platform binary from optional packages for Linux x86-64 or ARM64. Unsupported platforms fail during initialization with a direct diagnostic.
 
-The npm manifest and README use a concise, consistent description and focused search terms: `sandbox`, `linux-sandbox`, `nodejs-sandbox`, `process-isolation`, `untrusted-code`, `cgroups`, `namespaces`, `seccomp`, `file-upload-security`, and `cdr`. Repository, homepage, issues, engines, OS, CPU, license, and provenance metadata remain complete and accurate. GitHub topics mirror the main npm keywords.
+The npm manifest and README use a concise, consistent description and focused search terms: `sandbox`, `linux-sandbox`, `nodejs-sandbox`, `process-isolation`, `untrusted-code`, `cgroups`, `namespaces`, `seccomp`, `resource-limits`, and `rootless`. Repository, homepage, issues, engines, OS, CPU, license, and provenance metadata remain complete and accurate. GitHub topics mirror the main npm keywords.
 
 ## Verification gates
 
