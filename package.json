@@ -17,7 +17,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test test/*.spec.js",
+    "test": "npm run build && node --test test/*.spec.ts",
     "prepublishOnly": "npm run build"
   },
   "repository": {

@@ -3,6 +3,16 @@ import { load } from 'cheerio';
 import sanitizeHtml from 'sanitize-html';
 import sharp from 'sharp';
 
+export { SandboxError } from './errors.js';
+export { normalizeGuestPath } from './policy/paths.js';
+export { DEFAULT_CEILINGS, DEFAULT_LIMITS, resolvePolicy } from './policy/resolve.js';
+export type {
+  IsolationPolicy,
+  ResolvedPolicy,
+  ResourceLimits,
+  SandboxOptions,
+} from './types.js';
+
 export interface MicroSandboxOptions {
   mimeType: string;
   originalName?: string;
