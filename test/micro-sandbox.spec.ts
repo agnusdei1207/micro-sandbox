@@ -2,18 +2,18 @@ import assert from 'node:assert';
 import { test } from 'node:test';
 import { sanitizeFile, sanitizeHtmlDocument, sanitizeText } from '../dist/index.js';
 
-test('1. sanitizeText - Null byte 포함 텍스트 거부', () => {
+test('1. sanitizeText - Reject text stream containing null byte', () => {
   const badBuffer = Buffer.from('hello\0world', 'utf8');
   assert.throws(() => sanitizeText(badBuffer), /Null byte detected/);
 });
 
-test('2. sanitizeText - 정상 UTF-8 텍스트 성공', () => {
-  const goodBuffer = Buffer.from('안녕하세요 micro-sandbox 테스트입니다.', 'utf8');
+test('2. sanitizeText - Successfully validate valid UTF-8 text', () => {
+  const goodBuffer = Buffer.from('Hello, micro-sandbox test stream.', 'utf8');
   const result = sanitizeText(goodBuffer);
-  assert.strictEqual(result.toString('utf8'), '안녕하세요 micro-sandbox 테스트입니다.');
+  assert.strictEqual(result.toString('utf8'), 'Hello, micro-sandbox test stream.');
 });
 
-test('3. sanitizeHtmlDocument - 악성 script 및 이벤트 제거, CSP 주입', () => {
+test('3. sanitizeHtmlDocument - Remove malicious script & events, inject CSP', () => {
   const maliciousHtml = `
     <html>
       <head><title>Test</title></head>
@@ -31,7 +31,7 @@ test('3. sanitizeHtmlDocument - 악성 script 및 이벤트 제거, CSP 주입',
   assert.strictEqual(sanitized.includes('rel="noopener noreferrer"'), true);
 });
 
-test('4. sanitizeFile - PDF 매직 바이트 검증', async () => {
+test('4. sanitizeFile - Verify PDF magic byte signature', async () => {
   const fakePdf = Buffer.from('NOT_A_PDF_HEADER_DATA', 'utf8');
   await assert.rejects(
     async () => sanitizeFile(fakePdf, { mimeType: 'application/pdf' }),

@@ -19,7 +19,7 @@ export interface SanitizeResult {
 }
 
 /**
- * 1. 텍스트 / 코드 파일 유효성 검사 (Fatal UTF-8 Decoder & Null-Byte 차단)
+ * 1. Validate text/code file stream (Fatal UTF-8 Decoder & Null-Byte detection)
  */
 export function sanitizeText(buffer: Buffer): Buffer {
   if (buffer.includes(0)) {
@@ -35,15 +35,15 @@ export function sanitizeText(buffer: Buffer): Buffer {
 }
 
 /**
- * 2. 이미지 멸균 재인코딩 & EXIF 메타데이터 완전 소멸
+ * 2. Image sterilization & rasterization (Sharp-based RAM pixel extraction & EXIF metadata stripping)
  */
 export async function sanitizeImage(
   buffer: Buffer,
   format: 'webp' | 'png' | 'jpeg' = 'webp',
 ): Promise<Buffer> {
   const image = sharp(buffer);
-  
-  // EXIF 메타데이터, XMP, 텍스트 청크 자동 소멸 및 순수 픽셀 라스터라이즈
+
+  // Strip EXIF metadata, XMP, text chunks and re-encode pure pixel data
   if (format === 'png') {
     return image.rotate().png({ compressionLevel: 8 }).toBuffer();
   } else if (format === 'jpeg') {
@@ -53,7 +53,7 @@ export async function sanitizeImage(
 }
 
 /**
- * 3. HTML/SVG/DOM 2-Pass 무해화 & Dynamic Meta CSP 주입
+ * 3. HTML/SVG/DOM 2-Pass sanitization & Dynamic Meta CSP Injection
  */
 export function sanitizeHtmlDocument(htmlSource: string): string {
   const defaultCsp =
@@ -88,7 +88,7 @@ export function sanitizeHtmlDocument(htmlSource: string): string {
 }
 
 /**
- * 4. 리눅스 네임스페이스 기반 초경량 에페메럴 프로세스 격리 샌드박서 (Linux Kernel Isolation)
+ * 4. Lightweight Linux namespace-based process isolation sandbox runner
  */
 export async function runInLinuxKernelSandbox(
   taskFn: () => Promise<Buffer>,
@@ -126,7 +126,7 @@ export async function runInLinuxKernelSandbox(
 }
 
 /**
- * 🚀 micro-sandbox 메인 99.9% 대응 멸균 정화 엔트리포인트 함수
+ * 🚀 Main entry point for sandboxed CDR file sanitization
  */
 export async function sanitizeFile(
   buffer: Buffer,
