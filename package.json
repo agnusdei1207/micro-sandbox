@@ -9,6 +9,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "tsc && node --test test/*.spec.ts",
     "prepublishOnly": "npm run build"
   },
   "repository": {
@@ -27,10 +28,6 @@
   ],
   "author": "agnusdei1207",
   "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/agnusdei1207/micro-sandbox/issues"
-  },
-  "homepage": "https://github.com/agnusdei1207/micro-sandbox#readme",
   "dependencies": {
     "cheerio": "^1.0.0-rc.12",
     "sanitize-html": "^2.12.0",
