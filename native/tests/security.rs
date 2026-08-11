@@ -28,4 +28,6 @@ fn security_probe_drops_privilege_and_blocks_dangerous_syscalls() {
     }
     assert_eq!(report["ptraceBlocked"], true);
     assert_eq!(report["mountBlocked"], true);
+    assert_eq!(report["newMountApiBlocked"], true);
+    assert_eq!(report["namespaceCreationBlocked"], true);
 }

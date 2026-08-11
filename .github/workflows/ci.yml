@@ -12,11 +12,11 @@ jobs:
   node:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
           cache: npm
@@ -27,6 +27,19 @@ jobs:
   native:
     strategy:
       matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+      - run: rustup default 1.97.1
+      - run: cargo fmt --manifest-path native/Cargo.toml --check
+      - run: cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path native/Cargo.toml
+
+  kernel:
+    strategy:
+      matrix:
         include:
           - runner: ubuntu-24.04
             arch: x64
@@ -34,22 +47,13 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
-      - run: rustup default 1.97.1
-      - run: cargo fmt --manifest-path native/Cargo.toml --check
-      - run: cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings
-      - run: cargo test --locked --manifest-path native/Cargo.toml
-      - run: cargo build --locked --release --manifest-path native/Cargo.toml
-
-  kernel:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
       - run: npm ci
-      - run: npm run build:native:docker
+      - run: npm run build:native:docker -- --current=${{ matrix.arch }}
+      - run: npm run package:verify -- --current=${{ matrix.arch }}
       - run: npm run test:kernel
       - run: npm run test:integration
+      - run: npm run package:smoke -- --current=${{ matrix.arch }}

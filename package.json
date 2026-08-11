@@ -14,6 +14,7 @@
   },
   "files": [
     "dist",
+    "examples",
     "README.md",
     "LICENSE",
     "docs/ARCHITECTURE.md",
@@ -29,6 +30,8 @@
     "build:native": "node scripts/build-native.mjs",
     "build:native:docker": "node scripts/build-platforms.mjs",
     "package:verify": "node scripts/verify-package.mjs",
+    "package:smoke": "node scripts/pack-smoke.mjs",
+    "release:verify": "node scripts/verify-release.mjs",
     "check": "npm run test && npm run test:native && npm audit --audit-level=moderate",
     "prepack": "npm run clean && npm run build && node scripts/verify-package.mjs --source-only"
   },

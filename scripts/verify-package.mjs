@@ -33,9 +33,17 @@ for (const platform of packages) {
     await access(binary, constants.X_OK);
     const info = await stat(binary);
     assert(info.isFile(), `${platform.cpu} binary file`);
-    const header = (await readFile(binary)).subarray(0, 20);
+    const contents = await readFile(binary);
+    const header = contents.subarray(0, 64);
     assert(header.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])), `${platform.cpu} ELF`);
     assert(header.readUInt16LE(18) === platform.machine, `${platform.cpu} ELF architecture`);
+    const programOffset = Number(header.readBigUInt64LE(32));
+    const entrySize = header.readUInt16LE(54);
+    const entryCount = header.readUInt16LE(56);
+    const hasInterpreter = Array.from({ length: entryCount }, (_, index) =>
+      contents.readUInt32LE(programOffset + index * entrySize),
+    ).includes(3);
+    assert(!hasInterpreter, `${platform.cpu} static ELF`);
   }
 }
 

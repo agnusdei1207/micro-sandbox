@@ -71,6 +71,10 @@ test('normalizeGuestPath accepts a normalized absolute workspace path', () => {
   assert.equal(normalizeGuestPath('/workspace/input/file.txt'), '/workspace/input/file.txt');
 });
 
+test('normalizeGuestPath can explicitly allow the guest root for a working directory', () => {
+  assert.equal(normalizeGuestPath('/', true), '/');
+});
+
 test('normalizeGuestPath rejects traversal, relative, reserved, root, and NUL paths', () => {
   for (const path of [
     '../secret',

@@ -1,6 +1,39 @@
+use micro_sandbox_native::config::{MAX_RAW_IO_BYTES, ResourceLimits};
 use micro_sandbox_native::resources::{
-    ResourceFallbacks, ResourceSnapshot, admission_capacity, parse_cpu_max, parse_limit,
+    ResourceFallbacks, ResourceSnapshot, admission_capacity, effective_admission_capacity,
+    parse_cpu_max, parse_limit,
 };
+
+#[test]
+fn transport_limits_have_an_immutable_native_ceiling() {
+    let valid = ResourceLimits {
+        input_bytes: MAX_RAW_IO_BYTES,
+        output_bytes: MAX_RAW_IO_BYTES,
+        ..ResourceLimits::default()
+    };
+    assert!(valid.validate_transport_bounds().is_ok());
+
+    for invalid in [
+        ResourceLimits {
+            input_bytes: MAX_RAW_IO_BYTES + 1,
+            ..valid
+        },
+        ResourceLimits {
+            output_bytes: MAX_RAW_IO_BYTES + 1,
+            ..valid
+        },
+        ResourceLimits {
+            input_bytes: 0,
+            ..valid
+        },
+        ResourceLimits {
+            output_bytes: 0,
+            ..valid
+        },
+    ] {
+        assert!(invalid.validate_transport_bounds().is_err());
+    }
+}
 
 #[test]
 fn parses_cgroup_limits_without_confusing_max_for_zero() {
@@ -51,6 +84,37 @@ fn uses_host_fallbacks_when_the_parent_cgroup_is_unbounded() {
     assert_eq!(capacity.memory_bytes, 800);
     assert_eq!(capacity.cpu_millis, 3_200);
     assert_eq!(capacity.pids, 400);
+}
+
+#[test]
+fn uses_the_tightest_capacity_across_cgroup_ancestors() {
+    let capacity = effective_admission_capacity(
+        &[
+            ResourceSnapshot {
+                memory_limit_bytes: None,
+                memory_current_bytes: 10,
+                cpu_limit_millis: None,
+                pids_limit: None,
+                pids_current: 1,
+            },
+            ResourceSnapshot {
+                memory_limit_bytes: Some(1_000),
+                memory_current_bytes: 500,
+                cpu_limit_millis: Some(1_000),
+                pids_limit: Some(20),
+                pids_current: 10,
+            },
+        ],
+        ResourceFallbacks {
+            memory_bytes: 10_000,
+            cpu_millis: 8_000,
+            pids: 1_000,
+        },
+    );
+
+    assert_eq!(capacity.memory_bytes, 400);
+    assert_eq!(capacity.cpu_millis, 800);
+    assert_eq!(capacity.pids, 8);
 }
 
 #[test]

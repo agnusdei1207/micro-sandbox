@@ -34,14 +34,18 @@ export class SupervisorClient {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
       const onAbort = () => {
-        this.pending.delete(id);
-        this.transport.send({
-          version: PROTOCOL_VERSION,
-          id,
-          type: 'cancel',
-          payload: { requestId: id },
-        });
-        reject(new SandboxError('CANCELLED', 'Sandbox request was cancelled'));
+        try {
+          this.transport.send({
+            version: PROTOCOL_VERSION,
+            id,
+            type: 'cancel',
+            payload: { requestId: id },
+          });
+        } catch (error) {
+          this.pending.delete(id);
+          signal?.removeEventListener('abort', onAbort);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
       };
       if (signal) signal.addEventListener('abort', onAbort, { once: true });
       this.pending.set(id, {

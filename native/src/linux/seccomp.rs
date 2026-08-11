@@ -3,6 +3,7 @@ use std::io;
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
+const BPF_JMP_JSET_K: u16 = 0x45;
 #[cfg(target_arch = "x86_64")]
 const BPF_JMP_JGE_K: u16 = 0x35;
 const BPF_RET_K: u16 = 0x06;
@@ -39,6 +40,18 @@ pub fn apply_baseline() -> Result<(), SandboxError> {
         filter.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
         filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
     }
+    // clone3 stores flags behind a pointer that classic seccomp BPF cannot inspect.
+    filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1));
+    // ENOSYS lets libc safely fall back to legacy clone for ordinary threads/processes.
+    filter.push(statement(
+        BPF_RET_K,
+        SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+    ));
+    // Legacy clone may create processes, but may not create or join namespaces.
+    filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_clone as u32, 0, 3));
+    filter.push(statement(BPF_LD_W_ABS, 16));
+    filter.push(jump(BPF_JMP_JSET_K, namespace_clone_flags(), 0, 1));
+    filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
     filter.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
 
     let program = libc::sock_fprog {
@@ -65,6 +78,12 @@ pub fn apply_baseline() -> Result<(), SandboxError> {
 fn denied_syscalls() -> &'static [libc::c_long] {
     &[
         libc::SYS_mount,
+        libc::SYS_mount_setattr,
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
         libc::SYS_umount2,
         libc::SYS_pivot_root,
         libc::SYS_ptrace,
@@ -88,6 +107,17 @@ fn denied_syscalls() -> &'static [libc::c_long] {
         libc::SYS_acct,
         libc::SYS_quotactl,
     ]
+}
+
+const fn namespace_clone_flags() -> u32 {
+    (libc::CLONE_NEWCGROUP
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWNET
+        | libc::CLONE_NEWNS
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWTIME
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWUTS) as u32
 }
 
 const fn statement(code: u16, value: u32) -> libc::sock_filter {

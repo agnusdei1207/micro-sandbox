@@ -8,6 +8,18 @@ import type {
   SupervisorOutboundMessage,
   SupervisorTransport,
 } from '../dist/supervisor/transport.js';
+import { validateInboundMessage } from '../dist/supervisor/transport.js';
+
+test('transport validates native response schemas and stable error codes', () => {
+  assert.throws(
+    () => validateInboundMessage({ version: 1, id: 1, ok: false, error: { code: 'MADE_UP', message: 'x' } }),
+    (error: unknown) => error instanceof SandboxError && error.code === 'PROTOCOL_ERROR',
+  );
+  assert.deepEqual(
+    validateInboundMessage({ version: 1, id: 1, ok: false, error: { code: 'CGROUP_ERROR', message: 'x' } }),
+    { version: 1, id: 1, ok: false, error: { code: 'CGROUP_ERROR', message: 'x' } },
+  );
+});
 
 class FakeTransport implements SupervisorTransport {
   readonly sent: SupervisorOutboundMessage[] = [];
@@ -97,14 +109,23 @@ test('SupervisorClient sends cancellation and rejects an aborted request', async
   const runMessage = transport.sent[0];
 
   controller.abort();
-
-  await assert.rejects(pending, (error: unknown) => error instanceof SandboxError && error.code === 'CANCELLED');
   assert.deepEqual(transport.sent[1], {
     version: 1,
     id: runMessage.id,
     type: 'cancel',
     payload: { requestId: runMessage.id },
   });
+  let settled = false;
+  void pending.catch(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'cleanup acknowledgement must retain the request slot');
+  transport.respond({
+    version: 1,
+    id: runMessage.id,
+    ok: false,
+    error: { code: 'CANCELLED', message: 'cancelled' },
+  });
+  await assert.rejects(pending, (error: unknown) => error instanceof SandboxError && error.code === 'CANCELLED');
 });
 
 test('resolveSupervisorBinary rejects unsupported platforms and accepts an explicit override', () => {

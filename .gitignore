@@ -1,5 +1,6 @@
 node_modules
 dist
+artifacts
 native/target
 npm/*/bin/micro-sandbox
 .worktrees

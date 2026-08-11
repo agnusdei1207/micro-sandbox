@@ -10,6 +10,7 @@ function successfulResult(stdout = ''): JobResult {
     signal: null,
     timedOut: false,
     outputLimitExceeded: false,
+    oomKilled: false,
     stdout: Buffer.from(stdout),
     stderr: Buffer.alloc(0),
     isolation: {
@@ -119,16 +120,32 @@ test('Sandbox rejects overload beyond the bounded queue', async () => {
   );
 
   const first = sandbox.run({ command: '/app/task' });
-  const second = sandbox.run({ command: '/app/task' });
   await assert.rejects(
     sandbox.run({ command: '/app/task' }),
     (error: unknown) => error instanceof SandboxError && error.code === 'CAPACITY_EXCEEDED',
   );
   requester.completions[0](wireResult());
   await first;
-  await new Promise((resolve) => setImmediate(resolve));
-  requester.completions[1](wireResult());
-  await second;
+  await sandbox.close();
+});
+
+test('Sandbox removes an aborted queued request without starting it', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox(
+    { capacity: { maxInFlight: 1, maxQueue: 2, overload: 'wait' } },
+    async () => requester,
+  );
+  const first = sandbox.run({ command: '/app/task' });
+  const controller = new AbortController();
+  const queued = sandbox.run({ command: '/app/task', signal: controller.signal });
+  controller.abort();
+  await assert.rejects(
+    queued,
+    (error: unknown) => error instanceof SandboxError && error.code === 'CANCELLED',
+  );
+  requester.completions[0](wireResult());
+  await first;
+  assert.equal(requester.calls.length, 1);
   await sandbox.close();
 });
 
@@ -186,6 +203,7 @@ function wireResult(stdout = ''): Record<string, unknown> {
     signal: null,
     timedOut: false,
     outputLimitExceeded: false,
+    oomKilled: false,
     stdoutBase64: Buffer.from(stdout).toString('base64'),
     stderrBase64: '',
     isolation: successfulResult().isolation,
@@ -213,4 +231,38 @@ test('Sandbox close waits for the supervisor transport to finish closing', async
   releaseClose();
   await closing;
   assert.equal(closed, true);
+});
+
+test('Sandbox close rejects instead of hanging when supervisor startup failed', async () => {
+  const startupError = new Error('cannot start');
+  const sandbox = new Sandbox({}, async () => Promise.reject(startupError));
+
+  await assert.rejects(sandbox.run({ command: '/bin/true' }), startupError);
+  await assert.rejects(sandbox.close(), startupError);
+});
+
+test('Sandbox restarts a crashed supervisor for the next request', async () => {
+  let starts = 0;
+  const healthy = new ControlledRequester();
+  const sandbox = new Sandbox({}, async () => {
+    starts += 1;
+    if (starts === 1) {
+      return {
+        request: async () => { throw new SandboxError('SUPERVISOR_UNAVAILABLE', 'crashed'); },
+        close: async () => {},
+      };
+    }
+    return healthy;
+  });
+
+  await assert.rejects(
+    sandbox.run({ command: '/bin/true' }),
+    (error: unknown) => error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
+  );
+  const recovered = sandbox.run({ command: '/bin/true' });
+  await new Promise((resolve) => setImmediate(resolve));
+  healthy.completions[0](wireResult('ok'));
+  assert.equal((await recovered).stdout.toString(), 'ok');
+  assert.equal(starts, 2);
+  await sandbox.close();
 });

@@ -16,7 +16,7 @@ function validateLimits(label: string, limits: ResourceLimits): void {
   for (const [field, value] of Object.entries(limits) as Array<
     [keyof ResourceLimits, number]
   >) {
-    if (!Number.isFinite(value) || value <= 0 || (INTEGER_FIELDS.has(field) && !Number.isInteger(value))) {
+    if (!Number.isFinite(value) || value <= 0 || (INTEGER_FIELDS.has(field) && !Number.isSafeInteger(value))) {
       throw new SandboxError('POLICY_VIOLATION', `${label}.${field} must be a positive finite${INTEGER_FIELDS.has(field) ? ' integer' : ''}`, {
         field,
         value,

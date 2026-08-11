@@ -1,4 +1,5 @@
 use crate::error::SandboxError;
+use crate::linux::paths::resolve_runtime_directory;
 use std::ffi::CString;
 use std::fs;
 use std::io;
@@ -7,6 +8,18 @@ use std::path::{Path, PathBuf};
 
 const RUNTIME_DIRS: [&str; 5] = ["bin", "sbin", "usr", "lib", "lib64"];
 const SAFE_DEVICES: [&str; 4] = ["null", "zero", "random", "urandom"];
+const AT_RECURSIVE: libc::c_uint = 0x8000;
+const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+
+#[repr(C)]
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+}
 
 pub fn build_root(source_root: &Path, new_root: &Path) -> Result<(), SandboxError> {
     mount(
@@ -27,6 +40,7 @@ pub fn build_root(source_root: &Path, new_root: &Path) -> Result<(), SandboxErro
     for relative in RUNTIME_DIRS {
         let source = source_root.join(relative);
         if source.exists() {
+            let source = resolve_runtime_directory(source_root, relative)?;
             bind_read_only(&source, &new_root.join(relative))?;
         }
     }
@@ -80,13 +94,35 @@ fn bind_read_only(source: &Path, target: &Path) -> Result<(), SandboxError> {
         libc::MS_BIND | libc::MS_REC,
         None,
     )?;
-    mount(
-        None,
+    set_mount_attributes_recursive(
         target,
-        None,
-        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
-        None,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
     )
+}
+
+fn set_mount_attributes_recursive(target: &Path, attributes: u64) -> Result<(), SandboxError> {
+    let target = path_cstring(target)?;
+    let attr = MountAttr {
+        attr_set: attributes,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    // SAFETY: target and attr are valid for mount_setattr; AT_RECURSIVE applies to submounts.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            AT_RECURSIVE,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if result == -1 {
+        return Err(operation_error("mount_setattr"));
+    }
+    Ok(())
 }
 
 fn pivot_root(new_root: &Path) -> Result<(), SandboxError> {

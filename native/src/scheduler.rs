@@ -13,7 +13,7 @@ pub struct Capacity {
 pub type ResourceRequest = Capacity;
 
 impl Capacity {
-    fn checked_add(self, other: Self) -> Option<Self> {
+    pub fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             memory_bytes: self.memory_bytes.checked_add(other.memory_bytes)?,
             cpu_millis: self.cpu_millis.checked_add(other.cpu_millis)?,
@@ -58,12 +58,20 @@ impl Scheduler {
     }
 
     pub fn reserve(&self, request: ResourceRequest) -> Result<Reservation, SandboxError> {
+        self.reserve_with_limit(request, self.limit)
+    }
+
+    pub fn reserve_with_limit(
+        &self,
+        request: ResourceRequest,
+        live_limit: Capacity,
+    ) -> Result<Reservation, SandboxError> {
         let mut state = lock_unpoisoned(&self.state);
         let total = state
             .reserved
             .checked_add(request)
             .ok_or(SandboxError::CapacityExceeded)?;
-        if !total.fits_within(self.limit) {
+        if !total.fits_within(self.limit) || !total.fits_within(live_limit) {
             return Err(SandboxError::CapacityExceeded);
         }
         state.reserved = total;

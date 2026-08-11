@@ -25,6 +25,7 @@ interface QueueEntry {
   readonly request: JobRequest;
   readonly resolve: (result: JobResult) => void;
   readonly reject: (error: Error) => void;
+  removeAbort?: () => void;
 }
 
 interface WireJobResult extends Omit<JobResult, 'stdout' | 'stderr'> {
@@ -43,11 +44,13 @@ export class Sandbox implements AsyncDisposable {
   readonly profiles = new ProfileRegistry();
   private readonly capacity: Readonly<CapacityOptions>;
   private readonly queue: QueueEntry[] = [];
-  private requesterPromise?: Promise<SupervisorRequester>;
+  private requesterPromise: Promise<SupervisorRequester> | undefined;
+  private configurationLocked = false;
   private active = 0;
   private closing = false;
   private closePromise?: Promise<void>;
   private resolveClose: (() => void) | undefined;
+  private rejectClose: ((error: unknown) => void) | undefined;
 
   constructor(
     private readonly options: SandboxOptions = {},
@@ -57,8 +60,10 @@ export class Sandbox implements AsyncDisposable {
     if (
       !Number.isInteger(this.capacity.maxInFlight) ||
       this.capacity.maxInFlight <= 0 ||
+      this.capacity.maxInFlight > 64 ||
       !Number.isInteger(this.capacity.maxQueue) ||
       this.capacity.maxQueue < 0
+      || this.capacity.maxQueue > 10_000
     ) {
       throw new SandboxError('POLICY_VIOLATION', 'Capacity values are invalid');
     }
@@ -71,7 +76,13 @@ export class Sandbox implements AsyncDisposable {
       );
     }
     validateRequest(request);
-    if (this.active >= this.capacity.maxInFlight && this.queue.length >= this.capacity.maxQueue) {
+    if (request.signal?.aborted) {
+      return Promise.reject(new SandboxError('CANCELLED', 'Sandbox request was cancelled'));
+    }
+    if (
+      this.active >= this.capacity.maxInFlight &&
+      (this.capacity.overload === 'reject' || this.queue.length >= this.capacity.maxQueue)
+    ) {
       return Promise.reject(
         new SandboxError('CAPACITY_EXCEEDED', 'Sandbox queue is full', {
           maxQueue: this.capacity.maxQueue,
@@ -80,13 +91,25 @@ export class Sandbox implements AsyncDisposable {
     }
 
     return new Promise<JobResult>((resolve, reject) => {
-      this.queue.push({ request, resolve, reject });
+      const entry: QueueEntry = { request, resolve, reject };
+      if (request.signal) {
+        const onAbort = () => {
+          const index = this.queue.indexOf(entry);
+          if (index === -1) return;
+          this.queue.splice(index, 1);
+          reject(new SandboxError('CANCELLED', 'Sandbox request was cancelled'));
+          this.finishCloseIfIdle();
+        };
+        request.signal.addEventListener('abort', onAbort, { once: true });
+        entry.removeAbort = () => request.signal?.removeEventListener('abort', onAbort);
+      }
+      this.queue.push(entry);
       this.pump();
     });
   }
 
   registerRuntime(definition: RuntimeDefinition): Readonly<RuntimeDefinition> {
-    if (this.requesterPromise) {
+    if (this.configurationLocked) {
       throw new SandboxError(
         'POLICY_VIOLATION',
         'Runtimes must be registered before the supervisor starts',
@@ -96,7 +119,7 @@ export class Sandbox implements AsyncDisposable {
   }
 
   defineProfile(name: string, definition: ProfileDefinition): Readonly<ResolvedProfile> {
-    if (this.requesterPromise) {
+    if (this.configurationLocked) {
       throw new SandboxError(
         'POLICY_VIOLATION',
         'Profiles must be defined before the supervisor starts',
@@ -108,8 +131,9 @@ export class Sandbox implements AsyncDisposable {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
-    this.closePromise = new Promise<void>((resolve) => {
+    this.closePromise = new Promise<void>((resolve, reject) => {
       this.resolveClose = resolve;
+      this.rejectClose = reject;
     });
     this.finishCloseIfIdle();
     return this.closePromise;
@@ -123,6 +147,7 @@ export class Sandbox implements AsyncDisposable {
     while (this.active < this.capacity.maxInFlight && this.queue.length > 0) {
       const entry = this.queue.shift();
       if (!entry) break;
+      entry.removeAbort?.();
       this.active += 1;
       void this.execute(entry);
     }
@@ -164,6 +189,9 @@ export class Sandbox implements AsyncDisposable {
       );
       entry.resolve(decodeResult(result));
     } catch (error) {
+      if (error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE') {
+        this.requesterPromise = undefined;
+      }
       entry.reject(error instanceof Error ? error : new Error(String(error)));
     } finally {
       this.active -= 1;
@@ -173,17 +201,30 @@ export class Sandbox implements AsyncDisposable {
   }
 
   private getRequester(): Promise<SupervisorRequester> {
+    this.configurationLocked = true;
     this.requesterPromise ??= this.requesterFactory();
     return this.requesterPromise;
   }
 
   private finishCloseIfIdle(): void {
-    if (!this.closing || this.active > 0 || this.queue.length > 0 || !this.resolveClose) return;
+    if (
+      !this.closing ||
+      this.active > 0 ||
+      this.queue.length > 0 ||
+      !this.resolveClose ||
+      !this.rejectClose
+    ) return;
     const resolve = this.resolveClose;
+    const reject = this.rejectClose;
     this.resolveClose = undefined;
+    this.rejectClose = undefined;
     void (async () => {
-      if (this.requesterPromise) await (await this.requesterPromise).close();
-      resolve();
+      try {
+        if (this.requesterPromise) await (await this.requesterPromise).close();
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
     })();
   }
 }
@@ -196,9 +237,16 @@ function defaultRequesterFactory(options: SandboxOptions): RequesterFactory {
   return async () => {
     const override = options.supervisorBinary ?? process.env.MICRO_SANDBOX_BINARY;
     const binary = resolveSupervisorBinary(override ? { override } : {});
-    return new SupervisorClient(
+    const client = new SupervisorClient(
       new ChildProcessTransport(binary, resolveSupervisorEnvironment(options)),
     );
+    try {
+      await client.request('health', {});
+      return client;
+    } catch (error) {
+      await client.close();
+      throw error;
+    }
   };
 }
 
@@ -210,7 +258,7 @@ function validateRequest(request: JobRequest): void {
     );
   }
   if (request.command) normalizeGuestPath(request.command);
-  if (request.cwd) normalizeGuestPath(request.cwd);
+  if (request.cwd) normalizeGuestPath(request.cwd, true);
   if (request.args?.some((argument) => argument.includes('\0'))) {
     throw new SandboxError('POLICY_VIOLATION', 'Command arguments may not contain NUL');
   }
@@ -222,6 +270,7 @@ function decodeResult(result: WireJobResult): JobResult {
     signal: result.signal,
     timedOut: result.timedOut,
     outputLimitExceeded: result.outputLimitExceeded,
+    oomKilled: result.oomKilled,
     stdout: Buffer.from(result.stdoutBase64, 'base64'),
     stderr: Buffer.from(result.stderrBase64, 'base64'),
     isolation: Object.freeze({ ...result.isolation }),

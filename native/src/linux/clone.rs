@@ -28,6 +28,7 @@ pub struct NamespaceParent {
     pid: i32,
     pidfd: OwnedFd,
     release_fd: OwnedFd,
+    armed_fd: OwnedFd,
 }
 
 pub struct NamespaceChild {
@@ -44,6 +45,15 @@ pub fn clone_isolated(cgroup_fd: Option<RawFd>) -> Result<CloneOutcome, SandboxE
     let ready_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
     // SAFETY: pipe2 returned two new owned descriptors.
     let release_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+    let mut armed_fds = [-1; 2];
+    // SAFETY: armed_fds points to two writable integers; O_CLOEXEC is a valid flag.
+    if unsafe { libc::pipe2(armed_fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    // SAFETY: pipe2 returned two new owned descriptors.
+    let armed_fd = unsafe { OwnedFd::from_raw_fd(armed_fds[0]) };
+    // SAFETY: pipe2 returned two new owned descriptors.
+    let armed_write_fd = unsafe { OwnedFd::from_raw_fd(armed_fds[1]) };
 
     let mut pidfd = -1_i32;
     let mut flags = (libc::CLONE_NEWUSER
@@ -84,6 +94,7 @@ pub fn clone_isolated(cgroup_fd: Option<RawFd>) -> Result<CloneOutcome, SandboxE
     }
     if result == 0 {
         drop(release_fd);
+        drop(armed_fd);
         // SAFETY: PR_SET_PDEATHSIG configures a signal for this child if its launcher dies.
         if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } == -1 {
             return Err(SandboxError::Security(format!(
@@ -91,16 +102,26 @@ pub fn clone_isolated(cgroup_fd: Option<RawFd>) -> Result<CloneOutcome, SandboxE
                 io::Error::last_os_error()
             )));
         }
+        let byte = [1_u8];
+        // SAFETY: armed_write_fd is the child end of the parent-death handshake.
+        if unsafe { libc::write(raw_fd(&armed_write_fd), byte.as_ptr().cast(), 1) } != 1 {
+            return Err(SandboxError::Security(
+                "launcher exited during parent-death setup".into(),
+            ));
+        }
+        drop(armed_write_fd);
         return Ok(CloneOutcome::Child(NamespaceChild { ready_fd }));
     }
 
     drop(ready_fd);
+    drop(armed_write_fd);
     // SAFETY: CLONE_PIDFD initialized pidfd with a new descriptor in the parent.
     let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
     Ok(CloneOutcome::Parent(NamespaceParent {
         pid: result as i32,
         pidfd,
         release_fd,
+        armed_fd,
     }))
 }
 
@@ -110,25 +131,45 @@ impl NamespaceParent {
     }
 
     pub fn map_current_user_and_release(self) -> Result<RunningChild, SandboxError> {
+        let mut armed = [0_u8];
+        // SAFETY: armed_fd is readable and armed points to one writable byte.
+        if unsafe { libc::read(raw_fd(&self.armed_fd), armed.as_mut_ptr().cast(), 1) } != 1
+            || armed[0] != 1
+        {
+            return self.fail(SandboxError::Security(
+                "isolated child did not arm parent-death handling".into(),
+            ));
+        }
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         let proc_dir = format!("/proc/{}", self.pid);
         match fs::write(format!("{proc_dir}/setgroups"), "deny\n") {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(SandboxError::Io(error)),
+            Err(error) => return self.fail(SandboxError::Io(error)),
         }
-        fs::write(format!("{proc_dir}/uid_map"), format!("0 {uid} 1\n"))?;
-        fs::write(format!("{proc_dir}/gid_map"), format!("0 {gid} 1\n"))?;
+        if let Err(error) = fs::write(format!("{proc_dir}/uid_map"), format!("0 {uid} 1\n")) {
+            return self.fail(SandboxError::Io(error));
+        }
+        if let Err(error) = fs::write(format!("{proc_dir}/gid_map"), format!("0 {gid} 1\n")) {
+            return self.fail(SandboxError::Io(error));
+        }
         let byte = [1_u8];
         // SAFETY: release_fd is valid and byte points to one readable byte.
         if unsafe { libc::write(raw_fd(&self.release_fd), byte.as_ptr().cast(), 1) } != 1 {
-            return Err(SandboxError::Io(io::Error::last_os_error()));
+            return self.fail(SandboxError::Io(io::Error::last_os_error()));
         }
         Ok(RunningChild {
             pid: self.pid,
             pidfd: self.pidfd,
+            reaped: false,
         })
+    }
+
+    fn fail<T>(&self, error: SandboxError) -> Result<T, SandboxError> {
+        let _ = send_pidfd_signal(&self.pidfd, libc::SIGKILL);
+        reap(self.pid);
+        Err(error)
     }
 }
 
@@ -150,6 +191,7 @@ pub struct RunningChild {
     pid: i32,
     #[allow(dead_code)]
     pidfd: OwnedFd,
+    reaped: bool,
 }
 
 impl RunningChild {
@@ -177,11 +219,12 @@ impl RunningChild {
         Ok(())
     }
 
-    pub fn try_wait(&self) -> Result<Option<libc::c_int>, SandboxError> {
+    pub fn try_wait(&mut self) -> Result<Option<libc::c_int>, SandboxError> {
         let mut status = 0;
         // SAFETY: status points to writable memory and pid names our direct child.
         let result = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
         if result == self.pid {
+            self.reaped = true;
             return Ok(Some(status));
         }
         if result == 0 {
@@ -194,18 +237,66 @@ impl RunningChild {
         Err(SandboxError::Io(error))
     }
 
-    pub fn wait(self) -> Result<libc::c_int, SandboxError> {
+    pub fn wait(mut self) -> Result<libc::c_int, SandboxError> {
         let mut status = 0;
         loop {
             // SAFETY: status points to writable memory and pid names our direct child.
             let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
             if result == self.pid {
+                self.reaped = true;
                 return Ok(status);
             }
             if result == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
                 continue;
             }
             return Err(SandboxError::Io(io::Error::last_os_error()));
+        }
+    }
+
+    pub fn pidfd(&self) -> RawFd {
+        raw_fd(&self.pidfd)
+    }
+}
+
+impl Drop for RunningChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.send_signal(libc::SIGKILL);
+        reap(self.pid);
+        self.reaped = true;
+    }
+}
+
+fn send_pidfd_signal(pidfd: &OwnedFd, signal: i32) -> io::Result<()> {
+    // SAFETY: pidfd is owned and valid; null siginfo and flags 0 are documented.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            raw_fd(pidfd),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == -1 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn reap(pid: i32) {
+    loop {
+        // SAFETY: pid names our direct child; status is intentionally discarded.
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+        if result == pid
+            || (result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+        {
+            return;
+        }
+        if result == -1 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
         }
     }
 }

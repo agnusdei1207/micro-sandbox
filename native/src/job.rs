@@ -1,6 +1,6 @@
 use crate::config::ResourceLimits;
 use crate::error::SandboxError;
-use crate::linux::cgroup::Cgroup;
+use crate::linux::cgroup::{Cgroup, validate_job_id};
 use crate::linux::clone::{CloneOutcome, RunningChild, clone_isolated};
 use crate::linux::{capabilities, mount, seccomp};
 use base64::Engine;
@@ -39,6 +39,7 @@ pub struct LaunchResult {
     signal: Option<i32>,
     timed_out: bool,
     output_limit_exceeded: bool,
+    oom_killed: bool,
     stdout_base64: String,
     stderr_base64: String,
     isolation: IsolationReport,
@@ -71,6 +72,7 @@ struct JobMetrics {
 
 pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, SandboxError> {
     let started = Instant::now();
+    validate_job_id(&spec.job_id)?;
     let (rootfs, stdin) = validate_spec(&spec)?;
     let staging_root = StagingRoot::create(&spec.job_id)?;
     let mut cgroup = Cgroup::create(cgroup_root, &spec.job_id, spec.limits)?;
@@ -85,6 +87,7 @@ pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, Sand
                 mount::build_root(&rootfs, staging_root.path())?;
                 change_directory(&spec.cwd)?;
                 capabilities::drop_all()?;
+                disable_dumps()?;
                 seccomp::apply_baseline()?;
                 signal_ready(pipes.ready_write.as_raw_fd())?;
                 exec(&spec)
@@ -94,18 +97,25 @@ pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, Sand
         CloneOutcome::Parent(parent) => {
             let pipes = pipes.into_parent();
             let child = parent.map_current_user_and_release()?;
-            wait_until_ready(pipes.ready_read.as_raw_fd(), &child)?;
+            wait_until_ready(
+                pipes.ready_read.as_raw_fd(),
+                &child,
+                started + Duration::from_millis(spec.limits.timeout_ms),
+            )?;
             supervise_child(child, pipes, stdin, &spec, &mut cgroup, started)
         }
     }
 }
 
 fn validate_spec(spec: &LaunchSpec) -> Result<(PathBuf, Vec<u8>), SandboxError> {
-    if spec.limits.timeout_ms == 0 || spec.limits.output_bytes == 0 {
+    if spec.limits.timeout_ms == 0 {
         return Err(SandboxError::PolicyViolation(
-            "timeout and output limits must be positive".into(),
+            "timeout limit must be positive".into(),
         ));
     }
+    spec.limits
+        .validate_transport_bounds()
+        .map_err(|message| SandboxError::PolicyViolation(message.into()))?;
     let command = Path::new(&spec.command);
     if !command.is_absolute()
         || command
@@ -158,7 +168,7 @@ fn validate_spec(spec: &LaunchSpec) -> Result<(PathBuf, Vec<u8>), SandboxError> 
 }
 
 fn supervise_child(
-    child: RunningChild,
+    mut child: RunningChild,
     pipes: ParentPipes,
     stdin: Vec<u8>,
     spec: &LaunchSpec,
@@ -176,8 +186,10 @@ fn supervise_child(
     let stderr_reader = read_stream(pipes.stderr_read, remaining, overflow.clone());
     let deadline = started + Duration::from_millis(spec.limits.timeout_ms);
     let mut timed_out = false;
+    let mut observed_peak_memory = cgroup.memory_current_bytes().unwrap_or(0);
 
     let status = loop {
+        observed_peak_memory = observed_peak_memory.max(cgroup.memory_current_bytes().unwrap_or(0));
         if let Some(status) = child.try_wait()? {
             break status;
         }
@@ -191,7 +203,8 @@ fn supervise_child(
     };
 
     cgroup.kill_all()?;
-    let peak_memory_bytes = cgroup.memory_peak_bytes().unwrap_or(0);
+    let peak_memory_bytes = cgroup.memory_peak_bytes().unwrap_or(observed_peak_memory);
+    let oom_killed = cgroup.oom_killed();
     let stdout = join_reader(stdout_reader)?;
     let stderr = join_reader(stderr_reader)?;
     input_writer
@@ -218,6 +231,7 @@ fn supervise_child(
         signal,
         timed_out,
         output_limit_exceeded: overflow.load(Ordering::Acquire),
+        oom_killed,
         stdout_base64: base64::engine::general_purpose::STANDARD.encode(stdout),
         stderr_base64: base64::engine::general_purpose::STANDARD.encode(stderr),
         isolation: IsolationReport::complete(),
@@ -280,17 +294,77 @@ fn join_reader(
         .map_err(SandboxError::Io)
 }
 
-fn wait_until_ready(fd: RawFd, child: &RunningChild) -> Result<(), SandboxError> {
-    let mut byte = [0_u8];
-    // SAFETY: fd is the readable end of the setup pipe and byte is writable.
-    let result = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
-    if result == 1 && byte[0] == 1 {
-        return Ok(());
+fn wait_until_ready(
+    fd: RawFd,
+    child: &RunningChild,
+    deadline: Instant,
+) -> Result<(), SandboxError> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: child.pidfd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SandboxError::Security(
+                "isolated child setup timed out".into(),
+            ));
+        }
+        let timeout = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+        // SAFETY: descriptors points to two initialized pollfd values.
+        let result =
+            unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(SandboxError::Io(error));
+        }
+        if result == 0 {
+            continue;
+        }
+        if descriptors[0].revents & libc::POLLIN != 0 {
+            let mut byte = [0_u8];
+            // SAFETY: fd is the readable setup pipe and byte is writable.
+            if unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) } == 1 && byte[0] == 1 {
+                return Ok(());
+            }
+        }
+        return Err(SandboxError::Security(
+            "isolated child failed before completing security setup".into(),
+        ));
     }
-    let _ = child.send_signal(libc::SIGKILL);
-    Err(SandboxError::Security(
-        "isolated child failed before completing security setup".into(),
-    ))
+}
+
+fn disable_dumps() -> Result<(), SandboxError> {
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit points to a valid rlimit and RLIMIT_CORE is supported on Linux.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } == -1 {
+        return Err(SandboxError::Security(format!(
+            "RLIMIT_CORE: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: PR_SET_DUMPABLE accepts a scalar zero with zero trailing arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == -1 {
+        return Err(SandboxError::Security(format!(
+            "PR_SET_DUMPABLE: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 fn redirect_standard_streams(pipes: &ChildPipes) -> Result<(), SandboxError> {

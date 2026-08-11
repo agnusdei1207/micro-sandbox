@@ -1,8 +1,8 @@
 # micro-sandbox
 
-Fail-closed Linux process isolation for Node.js. Each command runs in disposable user, PID, mount, network, IPC, UTS, and cgroup namespaces with cgroup v2 limits, a private root, dropped capabilities, `no_new_privs`, seccomp, bounded I/O, and deterministic cleanup.
+Fail-closed Linux process isolation for Node.js. Untrusted commands run with user, PID, mount, network, IPC, UTS, and cgroup namespaces; cgroup v2 limits; a private root; zero capabilities; `no_new_privs`; seccomp; bounded I/O; and deterministic cleanup.
 
-Runtime: Linux 5.15+ on x64 or ARM64. Development and unit tests also work on Windows. Node.js 24.18+ LTS is required.
+Requires Node.js 24.18+ LTS and Linux 5.15+ at runtime (x64 or ARM64). Development and unit tests work on Windows.
 
 ```bash
 npm install micro-sandbox
@@ -12,7 +12,7 @@ npm install micro-sandbox
 import { createSandbox } from 'micro-sandbox';
 
 await using sandbox = await createSandbox({
-  cgroupRoot: '/sys/fs/cgroup/my-service/sandbox', // delegated cpu,memory,pids subtree
+  cgroupRoot: '/sys/fs/cgroup/my-service/sandbox',
 });
 
 sandbox.registerRuntime({
@@ -31,7 +31,7 @@ const result = await sandbox.run({
 console.log(result.stdout.toString()); // isolated: hello
 ```
 
-Defaults, hard ceilings, queue capacity, resource profiles, runtime roots, stdin, environment, working directory, cancellation, and the supervisor binary path are configurable. Core isolation controls cannot be disabled. Re-encoding and script recipes live in [`examples`](./examples); the package contains no file parser, sanitizer, storage adapter, or cloud coupling.
+Defaults, ceilings, queues, profiles, runtimes, stdin, environment, working directory, cancellation, and the native binary path are configurable. Core isolation cannot be disabled. Re-encoding and script execution are composition examples in [`examples`](./examples), not coupled parsers or cloud adapters.
 
 Architecture: [English](./docs/ARCHITECTURE.md) · [한국어](./docs/ARCHITECTURE.ko.md)
 

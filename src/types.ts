@@ -65,6 +65,7 @@ export interface JobResult {
   readonly signal: number | null;
   readonly timedOut: boolean;
   readonly outputLimitExceeded: boolean;
+  readonly oomKilled: boolean;
   readonly stdout: Buffer;
   readonly stderr: Buffer;
   readonly isolation: Readonly<IsolationPolicy>;

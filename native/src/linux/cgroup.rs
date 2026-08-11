@@ -96,6 +96,26 @@ impl Cgroup {
             .and_then(|value| value.trim().parse().ok())
     }
 
+    pub fn memory_current_bytes(&self) -> Option<u64> {
+        fs::read_to_string(self.path.join("memory.current"))
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    }
+
+    pub fn oom_killed(&self) -> bool {
+        fs::read_to_string(self.path.join("memory.events"))
+            .ok()
+            .and_then(|events| {
+                events.lines().find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    (fields.next()? == "oom_kill")
+                        .then(|| fields.next()?.parse::<u64>().ok())
+                        .flatten()
+                })
+            })
+            .is_some_and(|count| count > 0)
+    }
+
     pub fn cleanup(&mut self) -> Result<(), SandboxError> {
         if self.cleaned {
             return Ok(());
@@ -157,7 +177,7 @@ impl Drop for Cgroup {
     }
 }
 
-fn validate_job_id(job_id: &str) -> Result<(), SandboxError> {
+pub fn validate_job_id(job_id: &str) -> Result<(), SandboxError> {
     if job_id.is_empty()
         || job_id.len() > 64
         || !job_id
@@ -191,7 +211,7 @@ fn verify_cgroup2(root: &Path) -> Result<(), SandboxError> {
     }
     // SAFETY: statfs initialized `stats` after returning success.
     let stats = unsafe { stats.assume_init() };
-    if stats.f_type != CGROUP2_SUPER_MAGIC {
+    if stats.f_type as u64 != CGROUP2_SUPER_MAGIC as u64 {
         return Err(SandboxError::CgroupUnavailable(format!(
             "{} is not a cgroup v2 filesystem",
             root.display()

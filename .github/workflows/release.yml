@@ -19,46 +19,44 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
           registry-url: https://registry.npmjs.org
-      - run: rustup toolchain install 1.97.1 --profile minimal
-      - run: rustup default 1.97.1
       - run: npm ci
-      - run: npm run build:native
+      - run: npm run release:verify
+      - run: npm run test
+      - run: npm run test:native
+      - run: npm audit --audit-level=moderate
+      - run: npm run build:native:docker -- --current=${{ matrix.arch }}
       - run: npm run package:verify -- --current=${{ matrix.arch }}
-      - run: mkdir -p artifacts
-      - run: npm pack ./npm/linux-${{ matrix.arch }} --pack-destination artifacts
-      - uses: actions/upload-artifact@v7
+      - run: npm run test:kernel
+      - run: npm run test:integration
+      - run: npm run package:smoke -- --current=${{ matrix.arch }}
+      - run: sha256sum artifacts/*.tgz > artifacts/SHA256SUMS-${{ matrix.arch }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: platform-${{ matrix.arch }}
-          path: artifacts/*.tgz
+          path: artifacts/*
 
   publish:
     needs: platform
     runs-on: ubuntu-24.04
     environment: npm
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
           registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: platform-*
           path: artifacts
           merge-multiple: true
       - run: npm ci
-      - run: npm test
-      - run: npm publish artifacts/micro-sandbox-linux-x64-*.tgz --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish artifacts/micro-sandbox-linux-arm64-*.tgz --access public --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish --access public --provenance
+      - run: npm run release:verify
+      - run: node scripts/publish-if-missing.mjs
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

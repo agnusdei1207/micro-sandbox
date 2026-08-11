@@ -33,17 +33,59 @@ pub fn admission_capacity(snapshot: ResourceSnapshot, fallbacks: ResourceFallbac
     }
 }
 
+pub fn effective_admission_capacity(
+    snapshots: &[ResourceSnapshot],
+    fallbacks: ResourceFallbacks,
+) -> Capacity {
+    snapshots.iter().copied().fold(
+        admission_capacity(
+            ResourceSnapshot {
+                memory_limit_bytes: None,
+                memory_current_bytes: 0,
+                cpu_limit_millis: None,
+                pids_limit: None,
+                pids_current: 0,
+            },
+            fallbacks,
+        ),
+        |effective, snapshot| {
+            let capacity = admission_capacity(snapshot, fallbacks);
+            Capacity {
+                memory_bytes: effective.memory_bytes.min(capacity.memory_bytes),
+                cpu_millis: effective.cpu_millis.min(capacity.cpu_millis),
+                pids: effective.pids.min(capacity.pids),
+            }
+        },
+    )
+}
+
 pub fn detect_admission_capacity(cgroup_root: &Path) -> Result<Capacity, SandboxError> {
-    let snapshot = ResourceSnapshot {
-        memory_limit_bytes: parse_limit(&fs::read_to_string(cgroup_root.join("memory.max"))?)?,
-        memory_current_bytes: parse_number(&fs::read_to_string(
-            cgroup_root.join("memory.current"),
-        )?)?,
-        cpu_limit_millis: parse_cpu_max(&fs::read_to_string(cgroup_root.join("cpu.max"))?)?,
-        pids_limit: parse_limit(&fs::read_to_string(cgroup_root.join("pids.max"))?)?,
-        pids_current: parse_number(&fs::read_to_string(cgroup_root.join("pids.current"))?)?,
-    };
-    Ok(admission_capacity(snapshot, host_fallbacks()?))
+    let mut snapshots = Vec::new();
+    let mut current = Some(cgroup_root);
+    while let Some(path) = current {
+        if !path.join("cgroup.controllers").exists() {
+            break;
+        }
+        snapshots.push(read_snapshot(path)?);
+        current = path.parent();
+    }
+    if snapshots.is_empty() {
+        return Err(SandboxError::CgroupUnavailable(format!(
+            "{} has no readable cgroup controllers",
+            cgroup_root.display()
+        )));
+    }
+    Ok(effective_admission_capacity(&snapshots, host_fallbacks()?))
+}
+
+fn read_snapshot(cgroup: &Path) -> Result<ResourceSnapshot, SandboxError> {
+    Ok(ResourceSnapshot {
+        memory_limit_bytes: parse_limit(&fs::read_to_string(cgroup.join("memory.max"))?)?,
+        memory_current_bytes: parse_number(&fs::read_to_string(cgroup.join("memory.current"))?)?,
+        cpu_limit_millis: parse_cpu_max(&fs::read_to_string(cgroup.join("cpu.max"))?)?,
+        pids_limit: parse_limit(&fs::read_to_string(cgroup.join("pids.max"))?)?,
+        pids_current: parse_number(&fs::read_to_string(cgroup.join("pids.current"))?)?,
+    })
 }
 
 fn host_fallbacks() -> Result<ResourceFallbacks, SandboxError> {
@@ -58,7 +100,7 @@ fn host_fallbacks() -> Result<ResourceFallbacks, SandboxError> {
         .unwrap_or(u64::MAX)
         .saturating_mul(1000);
     let pid_max = parse_number(&fs::read_to_string("/proc/sys/kernel/pid_max")?)?;
-    let process_count = fs::read_dir("/proc")?
+    let task_count = fs::read_dir("/proc")?
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
@@ -67,11 +109,14 @@ fn host_fallbacks() -> Result<ResourceFallbacks, SandboxError> {
                 .iter()
                 .all(u8::is_ascii_digit)
         })
-        .count() as u64;
+        .map(|entry| {
+            fs::read_dir(entry.path().join("task")).map_or(0, |tasks| tasks.count() as u64)
+        })
+        .sum::<u64>();
     Ok(ResourceFallbacks {
         memory_bytes,
         cpu_millis,
-        pids: pid_max.saturating_sub(process_count),
+        pids: pid_max.saturating_sub(task_count),
     })
 }
 

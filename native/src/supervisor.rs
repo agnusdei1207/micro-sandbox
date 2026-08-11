@@ -1,5 +1,6 @@
 use crate::error::SandboxError;
 use crate::job::LaunchSpec;
+use crate::linux::cgroup::validate_job_id;
 use crate::linux::pidfd::PidFd;
 use crate::protocol::{
     MAX_FRAME_BYTES, PROTOCOL_VERSION, Request, Response, decode_request, encode_response,
@@ -10,15 +11,44 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::ops::{Deref, DerefMut};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
 struct ActiveJob {
     pidfd: PidFd,
     job_id: String,
     _reservation: Reservation,
+}
+
+struct ActiveJobs {
+    jobs: HashMap<u64, ActiveJob>,
+    cgroup_root: PathBuf,
+}
+
+impl Deref for ActiveJobs {
+    type Target = HashMap<u64, ActiveJob>;
+    fn deref(&self) -> &Self::Target {
+        &self.jobs
+    }
+}
+
+impl DerefMut for ActiveJobs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.jobs
+    }
+}
+
+impl Drop for ActiveJobs {
+    fn drop(&mut self) {
+        for job in self.jobs.values() {
+            let _ = job.pidfd.send_signal(libc::SIGKILL);
+            let _ = cleanup_cgroup(&self.cgroup_root, &job.job_id);
+        }
+    }
 }
 
 struct FinishedJob {
@@ -29,21 +59,38 @@ struct FinishedJob {
 struct RuntimeContext {
     cgroup_root: PathBuf,
     scheduler: Scheduler,
+    owner_token: String,
 }
+
+const MAX_ACTIVE_JOBS: usize = 64;
+const JOB_OVERHEAD: Capacity = Capacity {
+    memory_bytes: 16 * 1024 * 1024,
+    cpu_millis: 25,
+    pids: 3,
+};
 
 pub fn supervise() -> Result<(), SandboxError> {
     let cgroup_root = cgroup_root()?;
+    reconcile_stale_jobs(&cgroup_root)?;
     let context = RuntimeContext {
         scheduler: Scheduler::new(detect_admission_capacity(&cgroup_root)?),
+        owner_token: format!(
+            "{}-{}",
+            std::process::id(),
+            process_start_time(std::process::id())?
+        ),
         cgroup_root,
     };
-    let (request_tx, request_rx) = mpsc::channel();
-    let (finished_tx, finished_rx) = mpsc::channel();
+    let (request_tx, request_rx) = mpsc::sync_channel(MAX_ACTIVE_JOBS);
+    let (finished_tx, finished_rx) = mpsc::sync_channel(MAX_ACTIVE_JOBS);
     std::thread::spawn(move || read_requests(request_tx));
 
     let stdout = io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
-    let mut active = HashMap::<u64, ActiveJob>::new();
+    let mut active = ActiveJobs {
+        jobs: HashMap::new(),
+        cgroup_root: context.cgroup_root.clone(),
+    };
     let mut cancelled = HashSet::<u64>::new();
     let mut shutdown_id = None;
     let mut eof = false;
@@ -87,7 +134,7 @@ pub fn supervise() -> Result<(), SandboxError> {
 
 fn handle_request(
     request: Request,
-    finished_tx: &Sender<FinishedJob>,
+    finished_tx: &SyncSender<FinishedJob>,
     context: &RuntimeContext,
     active: &mut HashMap<u64, ActiveJob>,
     cancelled: &mut HashSet<u64>,
@@ -113,6 +160,17 @@ fn handle_request(
                     "available": context.scheduler.available(),
                 }),
             ),
+        ),
+        "run" if active.contains_key(&request.id) => write_response(
+            writer,
+            &Response::failure(
+                request.id,
+                &SandboxError::Protocol("request ID is already active".into()),
+            ),
+        ),
+        "run" if active.len() >= MAX_ACTIVE_JOBS => write_response(
+            writer,
+            &Response::failure(request.id, &SandboxError::CapacityExceeded),
         ),
         "run" => match start_job(request.id, request.payload, finished_tx, context) {
             Ok(job) => {
@@ -151,35 +209,82 @@ fn handle_request(
 fn start_job(
     request_id: u64,
     payload: Value,
-    finished_tx: &Sender<FinishedJob>,
+    finished_tx: &SyncSender<FinishedJob>,
     context: &RuntimeContext,
 ) -> Result<ActiveJob, SandboxError> {
-    let spec: LaunchSpec = serde_json::from_value(payload)?;
-    let request = resource_request(&spec)?;
-    if !request.fits_within(detect_admission_capacity(&context.cgroup_root)?) {
-        return Err(SandboxError::CapacityExceeded);
-    }
-    let reservation = context.scheduler.reserve(request)?;
+    let mut spec: LaunchSpec = serde_json::from_value(payload)?;
+    // The native supervisor owns filesystem identifiers; caller input is never used as a path.
+    spec.job_id = format!("job-{}-{request_id}", context.owner_token);
+    validate_job_id(&spec.job_id)?;
+    spec.limits
+        .validate_transport_bounds()
+        .map_err(|message| SandboxError::PolicyViolation(message.into()))?;
+    let request = resource_request(&spec)?
+        .checked_add(JOB_OVERHEAD)
+        .ok_or(SandboxError::CapacityExceeded)?;
+    let live_capacity = detect_admission_capacity(&context.cgroup_root)?;
+    let reservation = context
+        .scheduler
+        .reserve_with_limit(request, live_capacity)?;
     let executable = std::env::current_exe()?;
-    let mut child = Command::new(executable)
+    let job_id = spec.job_id.clone();
+    let (child_tx, child_rx) = mpsc::sync_channel::<Child>(1);
+    let waiter_finished_tx = finished_tx.clone();
+    std::thread::Builder::new()
+        .name(format!("micro-sandbox-wait-{request_id}"))
+        .spawn(move || {
+            if let Ok(child) = child_rx.recv() {
+                wait_for_job(child, request_id, waiter_finished_tx);
+            }
+        })?;
+    let mut command = Command::new(executable);
+    command
         .arg("launch")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    serde_json::to_writer(
-        child
+        .stderr(Stdio::piped());
+    // SAFETY: pre_exec only calls async-signal-safe libc functions.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                return Err(io::Error::from_raw_os_error(libc::EPIPE));
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    let setup = (|| {
+        let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| SandboxError::Security("launcher stdin is unavailable".into()))?,
-        &spec,
-    )?;
-    let pidfd = PidFd::open(i32::try_from(child.id()).map_err(|_| {
-        SandboxError::Security("launcher PID does not fit platform PID type".into())
-    })?)?;
-    let job_id = spec.job_id.clone();
-    let finished_tx = finished_tx.clone();
-    std::thread::spawn(move || wait_for_job(child, request_id, finished_tx));
+            .ok_or_else(|| SandboxError::Security("launcher stdin is unavailable".into()))?;
+        serde_json::to_writer(stdin, &spec)?;
+        let pid = i32::try_from(child.id()).map_err(|_| {
+            SandboxError::Security("launcher PID does not fit platform PID type".into())
+        })?;
+        PidFd::open(pid)
+    })();
+    let pidfd = match setup {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = cleanup_cgroup(&context.cgroup_root, &job_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = child_tx.send(child) {
+        let mut child = error.0;
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = cleanup_cgroup(&context.cgroup_root, &job_id);
+        return Err(SandboxError::Security(
+            "launcher waiter stopped unexpectedly".into(),
+        ));
+    }
     Ok(ActiveJob {
         pidfd,
         job_id,
@@ -204,7 +309,7 @@ fn resource_request(spec: &LaunchSpec) -> Result<Capacity, SandboxError> {
     })
 }
 
-fn wait_for_job(child: Child, request_id: u64, sender: Sender<FinishedJob>) {
+fn wait_for_job(child: Child, request_id: u64, sender: SyncSender<FinishedJob>) {
     let output = child.wait_with_output();
     let _ = sender.send(FinishedJob { request_id, output });
 }
@@ -260,6 +365,7 @@ fn cancel_all(active: &HashMap<u64, ActiveJob>, cancelled: &mut HashSet<u64>) {
 }
 
 fn cleanup_cgroup(root: &Path, job_id: &str) -> Result<(), SandboxError> {
+    validate_job_id(job_id)?;
     let path = root.join(job_id);
     if !path.exists() {
         return Ok(());
@@ -281,7 +387,49 @@ fn cleanup_cgroup(root: &Path, job_id: &str) -> Result<(), SandboxError> {
     }
 }
 
-fn read_requests(sender: Sender<Result<Option<Request>, SandboxError>>) {
+fn reconcile_stale_jobs(root: &Path) -> Result<(), SandboxError> {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let job_id = name.to_str().ok_or_else(|| {
+            SandboxError::CgroupUnavailable("cgroup job name is not UTF-8".into())
+        })?;
+        let Some((owner_pid, owner_start)) = job_owner(job_id) else {
+            continue;
+        };
+        if process_start_time(owner_pid).ok() == Some(owner_start) {
+            continue;
+        }
+        cleanup_cgroup(root, job_id)?;
+    }
+    Ok(())
+}
+
+fn job_owner(job_id: &str) -> Option<(u32, u64)> {
+    let mut fields = job_id.strip_prefix("job-")?.split('-');
+    let pid = fields.next()?.parse().ok()?;
+    let start = fields.next()?.parse().ok()?;
+    fields.next()?.parse::<u64>().ok()?;
+    fields.next().is_none().then_some((pid, start))
+}
+
+fn process_start_time(pid: u32) -> Result<u64, SandboxError> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let after_name = stat.rsplit_once(')').map(|(_, rest)| rest).ok_or_else(|| {
+        SandboxError::Security(format!("process {pid} has an invalid stat record"))
+    })?;
+    after_name
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| SandboxError::Security(format!("process {pid} start time is missing")))?
+        .parse()
+        .map_err(|_| SandboxError::Security(format!("process {pid} start time is invalid")))
+}
+
+fn read_requests(sender: SyncSender<Result<Option<Request>, SandboxError>>) {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     loop {

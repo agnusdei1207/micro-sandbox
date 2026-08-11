@@ -2,14 +2,19 @@ import { spawnSync } from 'node:child_process';
 import process from 'node:process';
 
 const mount = `${process.cwd()}:/work`;
-run([
-  'run', '--rm', '-v', mount, '-w', '/work', 'rust:1.97.1-bookworm', 'bash', '-c',
-  'cargo build --locked --release --manifest-path native/Cargo.toml && mkdir -p npm/linux-x64/bin && cp native/target/release/micro-sandbox npm/linux-x64/bin/micro-sandbox && chmod 755 npm/linux-x64/bin/micro-sandbox',
-]);
-run([
-  'run', '--rm', '-v', mount, '-w', '/work', 'rust:1.97.1-bookworm', 'bash', '-c',
-  'apt-get update -qq && apt-get install -y -qq gcc-aarch64-linux-gnu >/dev/null && rustup target add aarch64-unknown-linux-gnu && CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc cargo build --locked --release --target aarch64-unknown-linux-gnu --manifest-path native/Cargo.toml && mkdir -p npm/linux-arm64/bin && cp native/target/aarch64-unknown-linux-gnu/release/micro-sandbox npm/linux-arm64/bin/micro-sandbox && chmod 755 npm/linux-arm64/bin/micro-sandbox',
-]);
+const current = process.argv.find((value) => value.startsWith('--current='))?.split('=')[1];
+const platforms = [
+  { npmArch: 'x64', dockerArch: 'amd64' },
+  { npmArch: 'arm64', dockerArch: 'arm64' },
+];
+for (const platform of platforms) {
+  if (current && current !== platform.npmArch) continue;
+  run([
+    'run', '--rm', '--platform', `linux/${platform.dockerArch}`, '-v', mount, '-w', '/work',
+    'rust:1.97.1-alpine', 'sh', '-c',
+    `CARGO_TARGET_DIR=/tmp/target cargo build --locked --release --manifest-path native/Cargo.toml && mkdir -p npm/linux-${platform.npmArch}/bin && cp /tmp/target/release/micro-sandbox npm/linux-${platform.npmArch}/bin/micro-sandbox && chmod 755 npm/linux-${platform.npmArch}/bin/micro-sandbox`,
+  ]);
+}
 
 function run(args) {
   const result = spawnSync('docker', args, { stdio: 'inherit', shell: false });

@@ -71,6 +71,38 @@ fn concurrent_reservations_cannot_cross_the_limit() {
 }
 
 #[test]
+fn live_capacity_shrink_accounts_for_existing_reservations_atomically() {
+    let scheduler = Scheduler::new(Capacity {
+        memory_bytes: 100,
+        cpu_millis: 100,
+        pids: 100,
+    });
+    let _first = scheduler
+        .reserve(Capacity {
+            memory_bytes: 40,
+            cpu_millis: 40,
+            pids: 40,
+        })
+        .unwrap();
+    assert!(
+        scheduler
+            .reserve_with_limit(
+                Capacity {
+                    memory_bytes: 20,
+                    cpu_millis: 20,
+                    pids: 20
+                },
+                Capacity {
+                    memory_bytes: 50,
+                    cpu_millis: 50,
+                    pids: 50
+                },
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn compares_a_request_with_a_live_capacity_snapshot() {
     let request = Capacity {
         memory_bytes: 64,

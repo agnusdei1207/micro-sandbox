@@ -43,7 +43,7 @@ fn supervisor_cancels_a_running_process_tree() {
             "payload": spec("supervisor-cancel", "trap '' TERM; sleep 30", 30_000)
         }),
     );
-    wait_for_path(&std::path::Path::new(&cgroup_root).join("supervisor-cancel"));
+    let owned_job = wait_for_owned_job(std::path::Path::new(&cgroup_root), supervisor.id(), 51);
     send(
         &mut supervisor,
         json!({
@@ -59,9 +59,106 @@ fn supervisor_cancels_a_running_process_tree() {
     assert_eq!(response["error"]["code"], "CANCELLED");
     assert!(
         !std::path::Path::new(&cgroup_root)
-            .join("supervisor-cancel")
+            .join(owned_job.file_name().unwrap())
             .exists()
     );
+    stop_supervisor(supervisor);
+}
+
+#[test]
+fn a_restarted_supervisor_reconciles_jobs_left_by_a_crash() {
+    if !privileged() {
+        return;
+    }
+    let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
+    let mut supervisor = start_supervisor();
+    send(
+        &mut supervisor,
+        json!({
+            "version": 1,
+            "id": 61,
+            "type": "run",
+            "payload": spec("supervisor-crash", "sleep 30", 30_000)
+        }),
+    );
+    let stale = wait_for_owned_job(std::path::Path::new(&cgroup_root), supervisor.id(), 61);
+    supervisor.kill().unwrap();
+    supervisor.wait().unwrap();
+    wait_for_unpopulated(&stale);
+
+    let mut restarted = start_supervisor();
+    send(
+        &mut restarted,
+        json!({ "version": 1, "id": 62, "type": "health", "payload": {} }),
+    );
+    let response = receive(&mut restarted);
+    assert_eq!(response["ok"], true, "{response}");
+    assert!(!stale.exists());
+    stop_supervisor(restarted);
+}
+
+#[test]
+fn a_second_live_supervisor_does_not_reconcile_the_first_supervisors_jobs() {
+    if !privileged() {
+        return;
+    }
+    let root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
+    let mut first = start_supervisor();
+    send(
+        &mut first,
+        json!({
+            "version": 1,
+            "id": 81,
+            "type": "run",
+            "payload": spec("ignored", "sleep 30", 30_000)
+        }),
+    );
+    let active = wait_for_owned_job(std::path::Path::new(&root), first.id(), 81);
+
+    let mut second = start_supervisor();
+    send(
+        &mut second,
+        json!({ "version": 1, "id": 82, "type": "health", "payload": {} }),
+    );
+    assert_eq!(receive(&mut second)["ok"], true);
+    assert!(
+        active.exists(),
+        "second supervisor removed a live owner's job"
+    );
+
+    send(
+        &mut first,
+        json!({ "version": 1, "id": 83, "type": "cancel", "payload": { "requestId": 81 } }),
+    );
+    assert_eq!(receive(&mut first)["error"]["code"], "CANCELLED");
+    stop_supervisor(second);
+    stop_supervisor(first);
+}
+
+#[test]
+fn supervisor_ignores_caller_job_ids_and_uses_an_owned_identifier() {
+    if !privileged() {
+        return;
+    }
+    let mut supervisor = start_supervisor();
+    send(
+        &mut supervisor,
+        json!({
+            "version": 1,
+            "id": 71,
+            "type": "run",
+            "payload": spec("../outside", "true", 2_000)
+        }),
+    );
+    let response = receive(&mut supervisor);
+    assert_eq!(response["id"], 71);
+    assert_eq!(response["ok"], true, "{response}");
+
+    send(
+        &mut supervisor,
+        json!({ "version": 1, "id": 72, "type": "health", "payload": {} }),
+    );
+    assert_eq!(receive(&mut supervisor)["ok"], true);
     stop_supervisor(supervisor);
 }
 
@@ -117,12 +214,44 @@ fn spec(job_id: &str, script: &str, timeout_ms: u64) -> Value {
     })
 }
 
-fn wait_for_path(path: &std::path::Path) {
+fn wait_for_owned_job(root: &std::path::Path, pid: u32, request_id: u64) -> std::path::PathBuf {
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !path.exists() && Instant::now() < deadline {
+    let prefix = format!("job-{pid}-");
+    let suffix = format!("-{request_id}");
+    while Instant::now() < deadline {
+        if let Some(path) = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                (name.starts_with(&prefix) && name.ends_with(&suffix)).then(|| entry.path())
+            })
+        {
+            return path;
+        }
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(path.exists(), "{} was not created", path.display());
+    panic!(
+        "owned job {prefix}*{suffix} was not created below {}",
+        root.display()
+    );
+}
+
+fn wait_for_unpopulated(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let events = std::fs::read_to_string(path.join("cgroup.events")).unwrap_or_default();
+        if events.lines().any(|line| line == "populated 0") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} remained populated",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn decode(value: &Value) -> Vec<u8> {

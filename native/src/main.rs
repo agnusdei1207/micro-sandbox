@@ -163,6 +163,14 @@ fn security_probe() -> Result<(), SandboxError> {
     };
     let mount_blocked =
         mount == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    // SAFETY: seccomp rejects these syscalls before their invalid arguments are inspected.
+    let fsopen = unsafe { libc::syscall(libc::SYS_fsopen, std::ptr::null::<libc::c_char>(), 0) };
+    let new_mount_api_blocked =
+        fsopen == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    // SAFETY: seccomp rejects clone3 before dereferencing its null argument.
+    let clone3 = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0) };
+    let namespace_creation_blocked =
+        clone3 == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS);
 
     println!(
         "{}",
@@ -175,6 +183,8 @@ fn security_probe() -> Result<(), SandboxError> {
             "ambientCapabilities": masks.ambient,
             "ptraceBlocked": ptrace_blocked,
             "mountBlocked": mount_blocked,
+            "newMountApiBlocked": new_mount_api_blocked,
+            "namespaceCreationBlocked": namespace_creation_blocked,
         })
     );
     Ok(())

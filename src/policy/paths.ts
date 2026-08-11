@@ -3,7 +3,7 @@ import { SandboxError } from '../errors.js';
 
 const RESERVED_ROOTS = ['/dev', '/proc', '/sys'];
 
-export function normalizeGuestPath(candidate: string): string {
+export function normalizeGuestPath(candidate: string, allowRoot = false): string {
   if (
     candidate.length === 0 ||
     candidate.includes('\0') ||
@@ -16,7 +16,7 @@ export function normalizeGuestPath(candidate: string): string {
 
   const normalized = path.posix.normalize(candidate);
   if (
-    normalized === '/' ||
+    (!allowRoot && normalized === '/') ||
     RESERVED_ROOTS.some((root) => normalized === root || normalized.startsWith(`${root}/`))
   ) {
     throw invalidPath(candidate);
