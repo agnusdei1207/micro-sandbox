@@ -1,6 +1,6 @@
 {
   "name": "micro-sandbox-linux-arm64",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Linux ARM64 native binary for micro-sandbox",
   "license": "MIT",
   "os": ["linux"],

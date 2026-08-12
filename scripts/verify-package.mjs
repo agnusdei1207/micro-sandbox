@@ -1,8 +1,8 @@
-import { access, readFile, stat } from 'node:fs/promises';
+import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import process from 'node:process';
 
-const VERSION = '0.0.2';
+const VERSION = '0.0.3';
 const current = process.argv.find((argument) => argument.startsWith('--current='))?.split('=')[1];
 const packages = [
   { directory: 'npm/linux-x64', name: 'micro-sandbox-linux-x64', cpu: 'x64', machine: 0x3e },
@@ -18,6 +18,16 @@ assert(root.exports?.['.']?.import === './dist/index.js', 'ESM export');
 assert(root.exports?.['.']?.types === './dist/index.d.ts', 'type export');
 assert(root.optionalDependencies?.['micro-sandbox-linux-x64'] === VERSION, 'x64 dependency');
 assert(root.optionalDependencies?.['micro-sandbox-linux-arm64'] === VERSION, 'ARM64 dependency');
+assert(root.files?.includes('docs/ARCHITECTURE.md'), 'English architecture is packaged');
+assert(!root.files?.some((file) => file.endsWith('.ko.md')), 'translated docs are not packaged');
+
+const readme = await readFile('README.md', 'utf8');
+assert(!readme.includes('ARCHITECTURE.ko.md'), 'README has no translated-doc link');
+const markdownDocs = (await readdir('docs')).filter((file) => file.endsWith('.md'));
+assert(
+  markdownDocs.length === 1 && markdownDocs[0] === 'ARCHITECTURE.md',
+  'docs contains only the English architecture',
+);
 
 for (const platform of packages) {
   const manifest = JSON.parse(await readFile(`${platform.directory}/package.json`, 'utf8'));

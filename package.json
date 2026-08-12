@@ -1,6 +1,6 @@
 {
   "name": "@agnusdei12071207/micro-sandbox",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Fail-closed Linux sandbox for running untrusted commands from Node.js",
   "type": "module",
   "sideEffects": false,
@@ -17,8 +17,7 @@
     "examples",
     "README.md",
     "LICENSE",
-    "docs/ARCHITECTURE.md",
-    "docs/ARCHITECTURE.ko.md"
+    "docs/ARCHITECTURE.md"
   ],
   "scripts": {
     "clean": "node scripts/clean.mjs",
@@ -40,8 +39,8 @@
     "node": ">=24.18.0"
   },
   "optionalDependencies": {
-    "micro-sandbox-linux-arm64": "0.0.2",
-    "micro-sandbox-linux-x64": "0.0.2"
+    "micro-sandbox-linux-arm64": "0.0.3",
+    "micro-sandbox-linux-x64": "0.0.3"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

@@ -31,8 +31,14 @@ const result = await sandbox.run({
 console.log(result.stdout.toString()); // isolated: hello
 ```
 
+## Runtime setup
+
+`cgroupRoot` must be a dedicated, empty, writable cgroup-v2 subtree with the `cpu`, `memory`, and `pids` controllers delegated to the service. With systemd, configure the service with `Delegate=cpu memory pids`. `MICRO_SANDBOX_CGROUP_ROOT` can supply the same path globally.
+
+The package never elevates privileges or falls back to unisolated execution. Invalid delegation, unsupported kernels, or unsupported platforms fail during sandbox startup.
+
 Defaults, ceilings, queues, profiles, runtimes, stdin, environment, working directory, cancellation, and the native binary path are configurable. Core isolation cannot be disabled. Re-encoding and script execution are composition examples in [`examples`](./examples), not coupled parsers or cloud adapters.
 
-Architecture: [English](./docs/ARCHITECTURE.md) · [한국어](./docs/ARCHITECTURE.ko.md)
+Architecture: [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)
 
 MIT
