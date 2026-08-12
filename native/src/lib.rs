@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+pub mod artifact;
 pub mod config;
 pub mod error;
 #[cfg(target_os = "linux")]

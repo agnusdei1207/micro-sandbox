@@ -4,6 +4,7 @@ use std::io;
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
 const BPF_JMP_JSET_K: u16 = 0x45;
+const BPF_ALU_AND_K: u16 = 0x54;
 #[cfg(target_arch = "x86_64")]
 const BPF_JMP_JGE_K: u16 = 0x35;
 const BPF_RET_K: u16 = 0x06;
@@ -40,6 +41,16 @@ pub fn apply_baseline() -> Result<(), SandboxError> {
         filter.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
         filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
     }
+    // These regular-file preallocation ioctls reach vfs_fallocate with KEEP_SIZE
+    // and can bypass RLIMIT_FSIZE. Match type+number while retaining runtime ioctls.
+    filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_ioctl as u32, 0, 8));
+    filter.push(statement(BPF_LD_W_ABS, 24));
+    filter.push(statement(BPF_ALU_AND_K, 0xffff));
+    for command in [0x5828, 0x582a, 0x5839] {
+        filter.push(jump(BPF_JMP_JEQ_K, command, 0, 1));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+    }
+    filter.push(statement(BPF_LD_W_ABS, 0));
     // clone3 stores flags behind a pointer that classic seccomp BPF cannot inspect.
     filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1));
     // ENOSYS lets libc safely fall back to legacy clone for ordinary threads/processes.
@@ -106,6 +117,10 @@ fn denied_syscalls() -> &'static [libc::c_long] {
         libc::SYS_seccomp,
         libc::SYS_acct,
         libc::SYS_quotactl,
+        libc::SYS_fallocate,
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
     ]
 }
 

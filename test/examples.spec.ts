@@ -15,8 +15,8 @@ test('core exports only generic sandbox capabilities', () => {
 test('recipes compose caller-owned tools through the generic job request', () => {
   const image = imageReencodeJob(Buffer.from('pixels'));
   assert.equal(image.command, '/usr/bin/magick');
-  assert.deepEqual(image.args, ['-', 'png:-']);
-  assert.deepEqual(image.stdin, Buffer.from('pixels'));
+  assert.deepEqual(image.args, ['/input/upload', '-strip', '/output/safe.png']);
+  assert.deepEqual(image.artifacts.inputs[0].data, Buffer.from('pixels'));
 
   const script = scriptJob('console.log("isolated")');
   assert.equal(script.command, '/usr/bin/node');

@@ -1,6 +1,6 @@
 {
   "name": "micro-sandbox-linux-x64",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Linux x64 native binary for micro-sandbox",
   "license": "MIT",
   "os": ["linux"],

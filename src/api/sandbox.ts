@@ -1,4 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import {
+  defaultWorkspaceRoot,
+  prepareWorkspace,
+  removeWorkspace,
+  removeWorkspaceRoot,
+  reserveWorkspaceCapacity,
+  resolveArtifactLimits,
+} from '../artifacts/workspace.js';
 import { SandboxError } from '../errors.js';
 import { resolveSupervisorBinary } from '../platform/binary.js';
 import { resolveSupervisorEnvironment } from '../platform/environment.js';
@@ -18,6 +26,7 @@ import type {
 } from '../types.js';
 import { ProfileRegistry } from './profile-registry.js';
 import { RuntimeRegistry } from './runtime-registry.js';
+import { decodeJobResult, type WireJobResult } from './job-result.js';
 
 type RequesterFactory = () => Promise<SupervisorRequester>;
 
@@ -26,11 +35,6 @@ interface QueueEntry {
   readonly resolve: (result: JobResult) => void;
   readonly reject: (error: Error) => void;
   removeAbort?: () => void;
-}
-
-interface WireJobResult extends Omit<JobResult, 'stdout' | 'stderr'> {
-  readonly stdoutBase64: string;
-  readonly stderrBase64: string;
 }
 
 const DEFAULT_CAPACITY: Readonly<CapacityOptions> = Object.freeze({
@@ -51,11 +55,20 @@ export class Sandbox implements AsyncDisposable {
   private closePromise?: Promise<void>;
   private resolveClose: (() => void) | undefined;
   private rejectClose: ((error: unknown) => void) | undefined;
+  private readonly options: SandboxOptions;
+  private readonly requesterFactory: RequesterFactory;
+  private readonly workspaceRoot: string;
+  private readonly ownsWorkspaceRoot: boolean;
+  private workspaceReservedBytes = 0n;
 
   constructor(
-    private readonly options: SandboxOptions = {},
-    private readonly requesterFactory: RequesterFactory = defaultRequesterFactory(options),
+    options: SandboxOptions = {},
+    requesterFactory?: RequesterFactory,
   ) {
+    this.ownsWorkspaceRoot = options.workspaceRoot === undefined;
+    this.workspaceRoot = options.workspaceRoot ?? defaultWorkspaceRoot();
+    this.options = Object.freeze({ ...options, workspaceRoot: this.workspaceRoot });
+    this.requesterFactory = requesterFactory ?? defaultRequesterFactory(this.options);
     this.capacity = Object.freeze({ ...DEFAULT_CAPACITY, ...options.capacity });
     if (
       !Number.isInteger(this.capacity.maxInFlight) ||
@@ -154,7 +167,36 @@ export class Sandbox implements AsyncDisposable {
   }
 
   private async execute(entry: QueueEntry): Promise<void> {
+    let workspace: Awaited<ReturnType<typeof prepareWorkspace>> | undefined;
+    let workspaceReservation = 0n;
+    let completed: JobResult | undefined;
+    let failure: unknown;
     try {
+      if (entry.request.artifacts) {
+        const limits = resolveArtifactLimits(
+          this.options.artifactDefaults ?? {},
+          this.options.artifactCeilings ?? {},
+          entry.request.artifacts.limits ?? {},
+        );
+        const capacity = await reserveWorkspaceCapacity(
+          this.workspaceRoot,
+          limits,
+        );
+        if (this.workspaceReservedBytes + capacity.requested > capacity.usable) {
+          throw new SandboxError(
+            'CAPACITY_EXCEEDED',
+            'Concurrent artifact jobs exceed the workspace free-space reserve',
+          );
+        }
+        workspaceReservation = capacity.requested;
+        this.workspaceReservedBytes += workspaceReservation;
+        workspace = await prepareWorkspace(
+          this.workspaceRoot,
+          entry.request.artifacts,
+          limits,
+          entry.request.signal,
+        );
+      }
       const requester = await this.getRequester();
       const profileLimits = entry.request.profile
         ? this.profiles.get(entry.request.profile).limits
@@ -184,19 +226,34 @@ export class Sandbox implements AsyncDisposable {
           env: { ...entry.request.env },
           stdinBase64: Buffer.from(entry.request.stdin ?? '').toString('base64'),
           limits: policy.limits,
+          ...(workspace ? { workspace } : {}),
         },
         entry.request.signal,
       );
-      entry.resolve(decodeResult(result));
+      completed = await decodeJobResult(result, workspace, entry.request.signal);
     } catch (error) {
       if (error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE') {
         this.requesterPromise = undefined;
       }
-      entry.reject(error instanceof Error ? error : new Error(String(error)));
+      failure = error;
     } finally {
-      this.active -= 1;
-      this.pump();
-      this.finishCloseIfIdle();
+      try {
+        if (workspace) await removeWorkspace(workspace.path);
+      } catch (error) {
+        failure ??= error;
+      } finally {
+        this.workspaceReservedBytes -= workspaceReservation;
+        this.active -= 1;
+        this.pump();
+        this.finishCloseIfIdle();
+      }
+    }
+    if (failure !== undefined) {
+      entry.reject(failure instanceof Error ? failure : new Error(String(failure)));
+    } else if (completed) {
+      entry.resolve(completed);
+    } else {
+      entry.reject(new SandboxError('INTERNAL_ERROR', 'Sandbox job completed without a result'));
     }
   }
 
@@ -221,6 +278,7 @@ export class Sandbox implements AsyncDisposable {
     void (async () => {
       try {
         if (this.requesterPromise) await (await this.requesterPromise).close();
+        if (this.ownsWorkspaceRoot) await removeWorkspaceRoot(this.workspaceRoot);
         resolve();
       } catch (error) {
         reject(error);
@@ -262,18 +320,4 @@ function validateRequest(request: JobRequest): void {
   if (request.args?.some((argument) => argument.includes('\0'))) {
     throw new SandboxError('POLICY_VIOLATION', 'Command arguments may not contain NUL');
   }
-}
-
-function decodeResult(result: WireJobResult): JobResult {
-  return Object.freeze({
-    exitCode: result.exitCode,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    outputLimitExceeded: result.outputLimitExceeded,
-    oomKilled: result.oomKilled,
-    stdout: Buffer.from(result.stdoutBase64, 'base64'),
-    stderr: Buffer.from(result.stderrBase64, 'base64'),
-    isolation: Object.freeze({ ...result.isolation }),
-    metrics: Object.freeze({ ...result.metrics }),
-  });
 }

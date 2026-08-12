@@ -171,6 +171,25 @@ fn security_probe() -> Result<(), SandboxError> {
     let clone3 = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0) };
     let namespace_creation_blocked =
         clone3 == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS);
+    // SAFETY: seccomp rejects allocation and io_uring syscalls before inspecting arguments.
+    let fallocate = unsafe { libc::syscall(libc::SYS_fallocate, -1, 1, 0, 1024) };
+    let fallocate_blocked =
+        fallocate == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    // SAFETY: seccomp rejects io_uring_setup before dereferencing its null argument.
+    let io_uring = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_setup,
+            1,
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    let io_uring_blocked =
+        io_uring == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    // SAFETY: the invalid descriptor probes whether seccomp rejects this command
+    // before the kernel validates the file descriptor.
+    let preallocation_ioctl = unsafe { libc::syscall(libc::SYS_ioctl, -1, 0x5828_u64, 0) };
+    let preallocation_ioctl_blocked = preallocation_ioctl == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
 
     println!(
         "{}",
@@ -185,6 +204,9 @@ fn security_probe() -> Result<(), SandboxError> {
             "mountBlocked": mount_blocked,
             "newMountApiBlocked": new_mount_api_blocked,
             "namespaceCreationBlocked": namespace_creation_blocked,
+            "fallocateBlocked": fallocate_blocked,
+            "ioUringBlocked": io_uring_blocked,
+            "preallocationIoctlBlocked": preallocation_ioctl_blocked,
         })
     );
     Ok(())

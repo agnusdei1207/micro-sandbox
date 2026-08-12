@@ -1,3 +1,4 @@
+use crate::artifact::ValidatedWorkspace;
 use crate::error::SandboxError;
 use crate::linux::paths::resolve_runtime_directory;
 use std::ffi::CString;
@@ -12,6 +13,7 @@ const AT_RECURSIVE: libc::c_uint = 0x8000;
 const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
 const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
 const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
 
 #[repr(C)]
 struct MountAttr {
@@ -21,7 +23,11 @@ struct MountAttr {
     userns_fd: u64,
 }
 
-pub fn build_root(source_root: &Path, new_root: &Path) -> Result<(), SandboxError> {
+pub fn build_root(
+    source_root: &Path,
+    new_root: &Path,
+    workspace: Option<&ValidatedWorkspace>,
+) -> Result<(), SandboxError> {
     mount(
         None,
         Path::new("/"),
@@ -49,6 +55,9 @@ pub fn build_root(source_root: &Path, new_root: &Path) -> Result<(), SandboxErro
     fs::create_dir_all(new_root.join("tmp"))?;
     fs::create_dir_all(new_root.join("dev"))?;
     fs::create_dir_all(new_root.join(".old_root"))?;
+    if let Some(workspace) = workspace {
+        bind_artifacts(workspace, new_root)?;
+    }
     mount_safe_devices(new_root)?;
     mount(
         Some(Path::new("tmpfs")),
@@ -66,6 +75,44 @@ pub fn build_root(source_root: &Path, new_root: &Path) -> Result<(), SandboxErro
     )?;
 
     pivot_root(new_root)
+}
+
+fn bind_artifacts(workspace: &ValidatedWorkspace, new_root: &Path) -> Result<(), SandboxError> {
+    let input_target = new_root.join("input");
+    let output_target = new_root.join("output");
+    fs::create_dir_all(&input_target)?;
+    mount(
+        Some(&workspace.input),
+        &input_target,
+        None,
+        libc::MS_BIND,
+        None,
+    )?;
+    set_mount_attributes_recursive(
+        &input_target,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+    )?;
+    fs::create_dir_all(&output_target)?;
+    mount(
+        Some(&workspace.output),
+        &output_target,
+        None,
+        libc::MS_BIND,
+        None,
+    )?;
+    set_mount_attributes_recursive(
+        &output_target,
+        MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+    )?;
+    for declared in &workspace.outputs {
+        let target = output_target.join(&declared.relative);
+        mount(Some(&declared.host), &target, None, libc::MS_BIND, None)?;
+        set_mount_attributes_recursive(
+            &target,
+            MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
+        )?;
+    }
+    Ok(())
 }
 
 fn mount_safe_devices(new_root: &Path) -> Result<(), SandboxError> {

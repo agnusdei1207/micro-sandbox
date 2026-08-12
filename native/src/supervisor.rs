@@ -1,3 +1,4 @@
+use crate::artifact;
 use crate::error::SandboxError;
 use crate::job::LaunchSpec;
 use crate::linux::cgroup::validate_job_id;
@@ -15,6 +16,8 @@ use std::ops::{Deref, DerefMut};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
@@ -22,6 +25,7 @@ struct ActiveJob {
     pidfd: PidFd,
     job_id: String,
     _reservation: Reservation,
+    _workspace_reservation: Option<WorkspaceReservation>,
 }
 
 struct ActiveJobs {
@@ -60,6 +64,7 @@ struct RuntimeContext {
     cgroup_root: PathBuf,
     scheduler: Scheduler,
     owner_token: String,
+    workspace_reserved: Arc<AtomicU64>,
 }
 
 const MAX_ACTIVE_JOBS: usize = 64;
@@ -80,6 +85,7 @@ pub fn supervise() -> Result<(), SandboxError> {
             process_start_time(std::process::id())?
         ),
         cgroup_root,
+        workspace_reserved: Arc::new(AtomicU64::new(0)),
     };
     let (request_tx, request_rx) = mpsc::sync_channel(MAX_ACTIVE_JOBS);
     let (finished_tx, finished_rx) = mpsc::sync_channel(MAX_ACTIVE_JOBS);
@@ -226,6 +232,18 @@ fn start_job(
     let reservation = context
         .scheduler
         .reserve_with_limit(request, live_capacity)?;
+    let workspace_reservation = spec
+        .workspace
+        .as_ref()
+        .map(|workspace| {
+            let validated = artifact::validate_workspace(workspace)?;
+            WorkspaceReservation::reserve(
+                context.workspace_reserved.clone(),
+                artifact::available_bytes(&validated.output)?,
+                workspace.limits.output_bytes,
+            )
+        })
+        .transpose()?;
     let executable = std::env::current_exe()?;
     let job_id = spec.job_id.clone();
     let (child_tx, child_rx) = mpsc::sync_channel::<Child>(1);
@@ -289,7 +307,39 @@ fn start_job(
         pidfd,
         job_id,
         _reservation: reservation,
+        _workspace_reservation: workspace_reservation,
     })
+}
+
+struct WorkspaceReservation {
+    reserved: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl WorkspaceReservation {
+    fn reserve(reserved: Arc<AtomicU64>, available: u64, bytes: u64) -> Result<Self, SandboxError> {
+        let usable = available.saturating_mul(80) / 100;
+        let mut current = reserved.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(bytes)
+                .ok_or(SandboxError::CapacityExceeded)?;
+            if next > usable {
+                return Err(SandboxError::CapacityExceeded);
+            }
+            match reserved.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(Self { reserved, bytes }),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Drop for WorkspaceReservation {
+    fn drop(&mut self) {
+        self.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
 }
 
 fn resource_request(spec: &LaunchSpec) -> Result<Capacity, SandboxError> {

@@ -1,4 +1,9 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import { Sandbox } from '../dist/api/sandbox.js';
 import { SandboxError } from '../dist/errors.js';
@@ -28,6 +33,7 @@ function successfulResult(stdout = ''): JobResult {
       pivotRoot: true,
     },
     metrics: { durationMs: 1, peakMemoryBytes: 0 },
+    artifacts: [],
   };
 }
 
@@ -194,6 +200,118 @@ test('Sandbox resolves caller-owned runtimes, profiles, environment, and stdin',
   assert.equal((payload.limits as { memoryMb: number }).memoryMb, 64);
   requester.completions[0](wireResult('hello\n'));
   await pending;
+  await sandbox.close();
+});
+
+test('Sandbox stages buffer and stream artifacts without putting bytes in the control frame', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({}, async () => requester);
+  const pending = sandbox.run({
+    command: '/bin/sh',
+    args: ['-c', 'cat /input/a.bin /input/nested/b.bin > /output/result.bin'],
+    artifacts: {
+      inputs: [
+        { target: 'a.bin', data: Buffer.alloc(5 * 1024 * 1024, 0x61) },
+        { target: 'nested/b.bin', stream: Readable.from(Buffer.from('tail')) },
+      ],
+      outputs: [{ path: 'result.bin' }],
+      limits: { inputBytes: 8 * 1024 * 1024, outputBytes: 8 * 1024 * 1024 },
+    },
+  });
+  while (requester.calls.length === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const payload = requester.calls[0].payload as Record<string, unknown>;
+  assert.equal(JSON.stringify(payload).includes(Buffer.alloc(1024, 0x61).toString('base64')), false);
+  const workspace = payload.workspace as { path: string };
+  assert.ok(workspace.path);
+  await writeFile(`${workspace.path}/output/result.bin`, 'tail');
+  const sha256 = createHash('sha256').update('tail').digest('hex');
+  requester.completions[0]({
+    ...wireResult(),
+    artifacts: [{ path: 'result.bin', size: 4, sha256 }],
+  });
+
+  const result = await pending;
+  assert.deepEqual(result.artifacts, [{
+    path: 'result.bin', size: 4, sha256, data: Buffer.from('tail'),
+  }]);
+  await sandbox.close();
+});
+
+test('Sandbox cancels blocked artifact streams and removes their workspace', async () => {
+  const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'micro-sandbox-test-'));
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({ workspaceRoot }, async () => requester);
+  const controller = new AbortController();
+  const stream = Readable.from((async function* () {
+    yield Buffer.from('started');
+    await new Promise(() => undefined);
+  })());
+  const pending = sandbox.run({
+    command: '/bin/true',
+    signal: controller.signal,
+    artifacts: {
+      inputs: [{ target: 'upload.bin', stream }],
+      outputs: [{ path: 'result.bin' }],
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(pending, (error: unknown) => (
+    error instanceof SandboxError && error.code === 'CANCELLED'
+  ));
+  assert.deepEqual(await readdir(workspaceRoot), []);
+  assert.equal(requester.calls.length, 0);
+  await sandbox.close();
+});
+
+test('Sandbox rejects artifact targets that do not name a file', async () => {
+  const sandbox = new Sandbox({}, async () => new ControlledRequester());
+  await assert.rejects(
+    sandbox.run({
+      command: '/bin/true',
+      artifacts: {
+        inputs: [{ target: '.', data: 'invalid' }],
+        outputs: [{ path: 'result.bin' }],
+      },
+    }),
+    (error: unknown) => error instanceof SandboxError && error.code === 'POLICY_VIOLATION',
+  );
+  await sandbox.close();
+});
+
+test('Sandbox accepts five upload inputs with 5 MiB per-file and 8 MiB aggregate limits', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({}, async () => requester);
+  const mib = 1024 * 1024;
+  const pending = sandbox.run({
+    command: '/bin/true',
+    artifacts: {
+      inputs: [5, 1, 1, 0.5, 0.5].map((size, index) => ({
+        target: `upload-${index}.bin`,
+        data: Buffer.alloc(size * mib),
+      })),
+      limits: { inputFiles: 5, inputBytes: 8 * mib, inputFileBytes: 5 * mib },
+    },
+  });
+  while (requester.calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+  requester.completions[0](wireResult());
+  assert.deepEqual((await pending).artifacts, []);
+  await sandbox.close();
+});
+
+test('Sandbox rejects malformed native job results before exposing them', async () => {
+  const requester: SupervisorRequester = {
+    request: async () => ({ ...wireResult(), stdoutBase64: 'not-base64!' }),
+    close: async () => undefined,
+  };
+  const sandbox = new Sandbox({}, async () => requester);
+  await assert.rejects(
+    sandbox.run({ command: '/bin/true' }),
+    (error: unknown) => error instanceof SandboxError && error.code === 'PROTOCOL_ERROR',
+  );
   await sandbox.close();
 });
 

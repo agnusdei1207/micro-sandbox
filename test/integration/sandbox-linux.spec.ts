@@ -21,6 +21,32 @@ test('public API executes, threads, cancels, and cleans up isolated jobs', async
     assert.equal(result.stdout.toString(), 'public-api');
     assert.equal(result.isolation.pivotRoot, true);
 
+    const upload = Buffer.alloc(5 * 1024 * 1024, 0x5a);
+    const artifactResult = await sandbox.run({
+      runtime: 'system',
+      args: [
+        '-c',
+        'test ! -w /input/upload.bin && dd if=/input/upload.bin of=/output/reencoded.bin bs=65536 status=none',
+      ],
+      artifacts: {
+        inputs: [{ target: 'upload.bin', data: upload }],
+        outputs: [{ path: 'reencoded.bin' }],
+        limits: {
+          inputFiles: 5,
+          inputBytes: 8 * 1024 * 1024,
+          inputFileBytes: 5 * 1024 * 1024,
+          outputFiles: 5,
+          outputBytes: 8 * 1024 * 1024,
+          outputFileBytes: 5 * 1024 * 1024,
+        },
+      },
+      limits: { memoryMb: 64, pids: 8, timeoutMs: 5_000 },
+    });
+    assert.equal(artifactResult.exitCode, 0, artifactResult.stderr.toString());
+    assert.equal(artifactResult.artifacts.length, 1);
+    assert.equal(artifactResult.artifacts[0]?.path, 'reencoded.bin');
+    assert.deepEqual(artifactResult.artifacts[0]?.data, upload);
+
     const threaded = await sandbox.run({
       command: '/usr/local/bin/node',
       args: [

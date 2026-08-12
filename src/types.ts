@@ -14,6 +14,9 @@ export interface SandboxOptions {
   readonly supervisorBinary?: string;
   readonly rootfs?: string;
   readonly cgroupRoot?: string;
+  readonly workspaceRoot?: string;
+  readonly artifactDefaults?: Partial<ArtifactLimits>;
+  readonly artifactCeilings?: Partial<ArtifactLimits>;
 }
 
 export interface CapacityOptions {
@@ -53,6 +56,7 @@ export interface JobRequest {
   readonly stdin?: Uint8Array | string;
   readonly limits?: Partial<ResourceLimits>;
   readonly signal?: AbortSignal;
+  readonly artifacts?: ArtifactRequest;
 }
 
 export interface JobMetrics {
@@ -70,6 +74,7 @@ export interface JobResult {
   readonly stderr: Buffer;
   readonly isolation: Readonly<IsolationPolicy>;
   readonly metrics: Readonly<JobMetrics>;
+  readonly artifacts: readonly Readonly<OutputArtifact>[];
 }
 
 export interface SupervisorRequester {
@@ -91,4 +96,46 @@ export interface ProfileDefinition {
 export interface ResolvedProfile {
   readonly name: string;
   readonly limits: Readonly<Partial<ResourceLimits>>;
+}
+export interface ArtifactLimits {
+  readonly inputFiles: number;
+  readonly inputBytes: number;
+  readonly inputFileBytes: number;
+  readonly outputFiles: number;
+  readonly outputBytes: number;
+  readonly outputFileBytes: number;
+}
+
+export type ArtifactInput = {
+  readonly target: string;
+} & (
+  | { readonly data: Uint8Array | string }
+  | { readonly sourcePath: string }
+  | {
+      readonly stream: AsyncIterable<Uint8Array | string> & {
+        destroy(error?: Error): void;
+      };
+    }
+  | {
+      readonly iterable: (signal: AbortSignal) => AsyncIterable<Uint8Array | string>;
+    }
+);
+
+export interface ArtifactRequest {
+  readonly inputs?: readonly ArtifactInput[];
+  readonly outputs?: readonly ArtifactOutput[];
+  readonly limits?: Partial<ArtifactLimits>;
+}
+
+export interface ArtifactOutput {
+  readonly path: string;
+  readonly maxBytes?: number;
+  readonly required?: boolean;
+}
+
+export interface OutputArtifact {
+  readonly path: string;
+  readonly size: number;
+  readonly sha256: string;
+  readonly data: Buffer;
 }

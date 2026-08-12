@@ -33,4 +33,7 @@ fn security_probe_drops_privilege_and_blocks_dangerous_syscalls() {
     assert_eq!(report["mountBlocked"], true);
     assert_eq!(report["newMountApiBlocked"], true);
     assert_eq!(report["namespaceCreationBlocked"], true);
+    assert_eq!(report["fallocateBlocked"], true);
+    assert_eq!(report["ioUringBlocked"], true);
+    assert_eq!(report["preallocationIoctlBlocked"], true);
 }

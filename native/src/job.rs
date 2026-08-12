@@ -1,3 +1,4 @@
+use crate::artifact::{self, ArtifactManifestEntry, ValidatedWorkspace, WorkspaceSpec};
 use crate::config::ResourceLimits;
 use crate::error::SandboxError;
 use crate::linux::cgroup::{Cgroup, validate_job_id};
@@ -30,6 +31,8 @@ pub struct LaunchSpec {
     #[serde(default)]
     pub stdin_base64: String,
     pub limits: ResourceLimits,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceSpec>,
 }
 
 #[derive(Debug, Serialize)]
@@ -44,6 +47,7 @@ pub struct LaunchResult {
     stderr_base64: String,
     isolation: IsolationReport,
     metrics: JobMetrics,
+    artifacts: Vec<ArtifactManifestEntry>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,7 +77,7 @@ struct JobMetrics {
 pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, SandboxError> {
     let started = Instant::now();
     validate_job_id(&spec.job_id)?;
-    let (rootfs, stdin) = validate_spec(&spec)?;
+    let (rootfs, stdin, workspace) = validate_spec(&spec)?;
     let staging_root = StagingRoot::create(&spec.job_id)?;
     let mut cgroup = Cgroup::create(cgroup_root, &spec.job_id, spec.limits)?;
     let cgroup_fd = cgroup.open_fd()?;
@@ -84,8 +88,15 @@ pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, Sand
             let pipes = pipes.into_child();
             let outcome = child.wait_for_mapping().and_then(|()| {
                 redirect_standard_streams(&pipes)?;
-                mount::build_root(&rootfs, staging_root.path())?;
+                mount::build_root(&rootfs, staging_root.path(), workspace.as_ref())?;
                 change_directory(&spec.cwd)?;
+                if let Some(maximum) = workspace
+                    .as_ref()
+                    .and_then(|validated| validated.outputs.first())
+                    .map(|output| output.max_bytes)
+                {
+                    set_file_size_limit(maximum)?;
+                }
                 capabilities::drop_all()?;
                 disable_dumps()?;
                 seccomp::apply_baseline()?;
@@ -102,12 +113,22 @@ pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, Sand
                 &child,
                 started + Duration::from_millis(spec.limits.timeout_ms),
             )?;
-            supervise_child(child, pipes, stdin, &spec, &mut cgroup, started)
+            supervise_child(
+                child,
+                pipes,
+                stdin,
+                &spec,
+                workspace.as_ref(),
+                &mut cgroup,
+                started,
+            )
         }
     }
 }
 
-fn validate_spec(spec: &LaunchSpec) -> Result<(PathBuf, Vec<u8>), SandboxError> {
+fn validate_spec(
+    spec: &LaunchSpec,
+) -> Result<(PathBuf, Vec<u8>, Option<ValidatedWorkspace>), SandboxError> {
     if spec.limits.timeout_ms == 0 {
         return Err(SandboxError::PolicyViolation(
             "timeout limit must be positive".into(),
@@ -164,7 +185,12 @@ fn validate_spec(spec: &LaunchSpec) -> Result<(PathBuf, Vec<u8>), SandboxError> 
             spec.command
         )));
     }
-    Ok((rootfs, stdin))
+    let workspace = spec
+        .workspace
+        .as_ref()
+        .map(artifact::validate_workspace)
+        .transpose()?;
+    Ok((rootfs, stdin, workspace))
 }
 
 fn supervise_child(
@@ -172,6 +198,7 @@ fn supervise_child(
     pipes: ParentPipes,
     stdin: Vec<u8>,
     spec: &LaunchSpec,
+    workspace: Option<&ValidatedWorkspace>,
     cgroup: &mut Cgroup,
     started: Instant,
 ) -> Result<LaunchResult, SandboxError> {
@@ -187,11 +214,24 @@ fn supervise_child(
     let deadline = started + Duration::from_millis(spec.limits.timeout_ms);
     let mut timed_out = false;
     let mut observed_peak_memory = cgroup.memory_current_bytes().unwrap_or(0);
+    let mut artifact_error = None;
+    let mut next_artifact_check = Instant::now();
 
     let status = loop {
         observed_peak_memory = observed_peak_memory.max(cgroup.memory_current_bytes().unwrap_or(0));
         if let Some(status) = child.try_wait()? {
             break status;
+        }
+        if Instant::now() >= next_artifact_check {
+            if let (Some(workspace), Some(workspace_spec)) = (workspace, &spec.workspace)
+                && let Err(error) = artifact::validate_outputs(workspace, workspace_spec.limits)
+            {
+                artifact_error = Some(error);
+                child.send_signal(libc::SIGKILL)?;
+                cgroup.kill_all()?;
+                break child.wait()?;
+            }
+            next_artifact_check = Instant::now() + Duration::from_millis(20);
         }
         if Instant::now() >= deadline || overflow.load(Ordering::Acquire) {
             timed_out = Instant::now() >= deadline;
@@ -218,6 +258,15 @@ fn supervise_child(
             }
         })?;
     cgroup.cleanup()?;
+    if let Some(error) = artifact_error {
+        return Err(error);
+    }
+    let artifacts = match (workspace, &spec.workspace) {
+        (Some(workspace), Some(workspace_spec)) => {
+            artifact::collect_outputs(workspace, workspace_spec.limits)?
+        }
+        _ => Vec::new(),
+    };
 
     let (exit_code, signal) = if libc::WIFEXITED(status) {
         (Some(libc::WEXITSTATUS(status)), None)
@@ -239,7 +288,23 @@ fn supervise_child(
             duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             peak_memory_bytes,
         },
+        artifacts,
     })
+}
+
+fn set_file_size_limit(bytes: u64) -> Result<(), SandboxError> {
+    let limit = libc::rlimit {
+        rlim_cur: bytes,
+        rlim_max: bytes,
+    };
+    // SAFETY: limit points to a valid rlimit value for the current isolated process.
+    if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) } == -1 {
+        return Err(SandboxError::Security(format!(
+            "setrlimit RLIMIT_FSIZE: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 fn read_stream(
