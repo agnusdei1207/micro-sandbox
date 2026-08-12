@@ -2,7 +2,6 @@ import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import process from 'node:process';
 
-const VERSION = '0.0.4';
 const current = process.argv.find((argument) => argument.startsWith('--current='))?.split('=')[1];
 const packages = [
   { directory: 'npm/linux-x64', name: 'micro-sandbox-linux-x64', cpu: 'x64', machine: 0x3e },
@@ -10,14 +9,15 @@ const packages = [
 ];
 
 const root = JSON.parse(await readFile('package.json', 'utf8'));
+const version = root.version;
 assert(root.name === '@agnusdei12071207/micro-sandbox', 'main package name');
-assert(root.version === VERSION, 'main package version');
+assert(typeof version === 'string' && /^\d+\.\d+\.\d+$/.test(version), 'main package version');
 assert(root.engines?.node === '>=24.18.0', 'Node LTS engine');
 assert(root.type === 'module', 'ESM package type');
 assert(root.exports?.['.']?.import === './dist/index.js', 'ESM export');
 assert(root.exports?.['.']?.types === './dist/index.d.ts', 'type export');
-assert(root.optionalDependencies?.['micro-sandbox-linux-x64'] === VERSION, 'x64 dependency');
-assert(root.optionalDependencies?.['micro-sandbox-linux-arm64'] === VERSION, 'ARM64 dependency');
+assert(root.optionalDependencies?.['micro-sandbox-linux-x64'] === version, 'x64 dependency');
+assert(root.optionalDependencies?.['micro-sandbox-linux-arm64'] === version, 'ARM64 dependency');
 assert(root.files?.includes('docs/ARCHITECTURE.md'), 'English architecture is packaged');
 assert(!root.files?.some((file) => file.endsWith('.ko.md')), 'translated docs are not packaged');
 
@@ -32,7 +32,7 @@ assert(
 for (const platform of packages) {
   const manifest = JSON.parse(await readFile(`${platform.directory}/package.json`, 'utf8'));
   assert(manifest.name === platform.name, `${platform.cpu} package name`);
-  assert(manifest.version === VERSION, `${platform.cpu} package version`);
+  assert(manifest.version === version, `${platform.cpu} package version`);
   assert(manifest.os?.length === 1 && manifest.os[0] === 'linux', `${platform.cpu} OS`);
   assert(manifest.cpu?.length === 1 && manifest.cpu[0] === platform.cpu, `${platform.cpu} CPU`);
   assert(manifest.exports?.['./bin/micro-sandbox'] === './bin/micro-sandbox', `${platform.cpu} export`);

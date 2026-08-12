@@ -1,6 +1,6 @@
 {
   "name": "@agnusdei12071207/micro-sandbox",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "Fail-closed Linux sandbox for running untrusted commands from Node.js",
   "type": "module",
   "sideEffects": false,
@@ -40,8 +40,8 @@
     "node": ">=24.18.0"
   },
   "optionalDependencies": {
-    "micro-sandbox-linux-arm64": "0.0.4",
-    "micro-sandbox-linux-x64": "0.0.4"
+    "micro-sandbox-linux-arm64": "0.0.5",
+    "micro-sandbox-linux-x64": "0.0.5"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
