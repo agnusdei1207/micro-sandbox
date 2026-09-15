@@ -9,11 +9,11 @@ echo '+cpu +memory +pids' > /tmp/micro-sandbox-cgroup/cgroup.subtree_control
 echo '+cpu +memory +pids' > /tmp/micro-sandbox-cgroup/jobs/cgroup.subtree_control
 
 export MICRO_SANDBOX_CGROUP_ROOT=/tmp/micro-sandbox-cgroup/jobs
-export MICRO_SANDBOX_PRIVILEGED_TESTS=1
 
 exec cargo test --jobs 2 --manifest-path native/Cargo.toml \
   --test namespace \
   --test job_cli \
+  --test security \
   --test supervisor_run \
   --test supervisor_cli \
-  -- --nocapture
+  -- --nocapture --include-ignored

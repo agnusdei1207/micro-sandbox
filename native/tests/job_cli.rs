@@ -6,10 +6,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn mounts_large_inputs_read_only_and_collects_regular_outputs() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let workspace_root = tempfile::tempdir().unwrap();
     let workspace = workspace_root.path().join("job-artifacts");
@@ -70,10 +68,8 @@ fn mounts_large_inputs_read_only_and_collects_regular_outputs() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn rejects_an_input_above_the_native_per_file_limit() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let workspace_root = tempfile::tempdir().unwrap();
     let workspace = workspace_root.path().join("job-input-limit");
@@ -113,10 +109,8 @@ fn rejects_an_input_above_the_native_per_file_limit() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn runs_a_command_in_a_disposable_fully_isolated_job() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_micro-sandbox"))
         .arg("launch")
@@ -179,10 +173,8 @@ fn runs_a_command_in_a_disposable_fully_isolated_job() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn passes_bounded_input_environment_and_working_directory() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let output = run_launch(
         &cgroup_root,
@@ -217,10 +209,8 @@ fn passes_bounded_input_environment_and_working_directory() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn enforces_one_aggregate_output_limit_across_stdout_and_stderr() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let output = run_launch(
         &cgroup_root,
@@ -256,10 +246,8 @@ fn enforces_one_aggregate_output_limit_across_stdout_and_stderr() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn kills_a_timed_out_process_tree_and_cleans_its_cgroup() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_micro-sandbox"))
         .arg("launch")

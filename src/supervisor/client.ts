@@ -15,6 +15,7 @@ export class SupervisorClient {
   private readonly pending = new Map<number, PendingRequest>();
   private nextId = 1;
   private closed = false;
+  private closePromise?: Promise<void>;
 
   constructor(private readonly transport: SupervisorTransport) {
     transport.onMessage((message) => this.handleMessage(message));
@@ -41,10 +42,10 @@ export class SupervisorClient {
             type: 'cancel',
             payload: { requestId: id },
           });
-        } catch (error) {
-          this.pending.delete(id);
-          signal?.removeEventListener('abort', onAbort);
-          reject(error instanceof Error ? error : new Error(String(error)));
+        } catch {
+          // Without a cancellation acknowledgement the job may still own its workspace.
+          // Terminate the transport and retain every pending request until it has closed.
+          void this.close().catch(() => undefined);
         }
       };
       if (signal) signal.addEventListener('abort', onAbort, { once: true });
@@ -65,14 +66,17 @@ export class SupervisorClient {
     });
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.rejectPending(new SandboxError('SUPERVISOR_UNAVAILABLE', 'Sandbox client closed'));
-    await this.transport.close();
+    this.closePromise = this.transport.close().finally(() => {
+      this.rejectPending(new SandboxError('SUPERVISOR_UNAVAILABLE', 'Sandbox client closed'));
+    });
+    return this.closePromise;
   }
 
   private handleMessage(message: SupervisorInboundMessage): void {
+    if (this.closed) return;
     if ('event' in message) return;
     if (message.version !== PROTOCOL_VERSION) {
       this.handleClose(new Error(`Unsupported supervisor protocol ${message.version}`));

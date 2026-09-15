@@ -66,6 +66,19 @@ pub fn detect_admission_capacity(cgroup_root: &Path) -> Result<Capacity, Sandbox
         if !path.join("cgroup.controllers").exists() {
             break;
         }
+        // The real cgroup-v2 root has controllers but no resource limit files.
+        // A namespace root may have limits, so still read those when present.
+        let hierarchy_root = path
+            .parent()
+            .is_none_or(|parent| !parent.join("cgroup.controllers").exists());
+        if !snapshots.is_empty()
+            && hierarchy_root
+            && ["memory.max", "cpu.max", "pids.max"]
+                .iter()
+                .all(|name| !path.join(name).exists())
+        {
+            break;
+        }
         snapshots.push(read_snapshot(path)?);
         current = path.parent();
     }

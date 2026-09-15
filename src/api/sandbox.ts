@@ -3,13 +3,12 @@ import {
   defaultWorkspaceRoot,
   prepareWorkspace,
   removeWorkspace,
-  removeWorkspaceRoot,
   reserveWorkspaceCapacity,
-  resolveArtifactLimits,
 } from '../artifacts/workspace.js';
 import { SandboxError } from '../errors.js';
 import { resolveSupervisorBinary } from '../platform/binary.js';
 import { resolveSupervisorEnvironment } from '../platform/environment.js';
+import { resolveArtifactLimits } from '../policy/artifacts.js';
 import { normalizeGuestPath } from '../policy/paths.js';
 import { resolvePolicy } from '../policy/resolve.js';
 import { SupervisorClient } from '../supervisor/client.js';
@@ -49,7 +48,6 @@ export class Sandbox implements AsyncDisposable {
   private readonly capacity: Readonly<CapacityOptions>;
   private readonly queue: QueueEntry[] = [];
   private requesterPromise: Promise<SupervisorRequester> | undefined;
-  private configurationLocked = false;
   private active = 0;
   private closing = false;
   private closePromise?: Promise<void>;
@@ -122,22 +120,10 @@ export class Sandbox implements AsyncDisposable {
   }
 
   registerRuntime(definition: RuntimeDefinition): Readonly<RuntimeDefinition> {
-    if (this.configurationLocked) {
-      throw new SandboxError(
-        'POLICY_VIOLATION',
-        'Runtimes must be registered before the supervisor starts',
-      );
-    }
     return this.runtimes.register(definition);
   }
 
   defineProfile(name: string, definition: ProfileDefinition): Readonly<ResolvedProfile> {
-    if (this.configurationLocked) {
-      throw new SandboxError(
-        'POLICY_VIOLATION',
-        'Profiles must be defined before the supervisor starts',
-      );
-    }
     return this.profiles.define(name, definition);
   }
 
@@ -171,7 +157,9 @@ export class Sandbox implements AsyncDisposable {
     let workspaceReservation = 0n;
     let completed: JobResult | undefined;
     let failure: unknown;
+    let requesterPromise: Promise<SupervisorRequester> | undefined;
     try {
+      const payload = this.resolveRunPayload(entry.request);
       if (entry.request.artifacts) {
         const limits = resolveArtifactLimits(
           this.options.artifactDefaults ?? {},
@@ -197,45 +185,32 @@ export class Sandbox implements AsyncDisposable {
           entry.request.signal,
         );
       }
-      const requester = await this.getRequester();
-      const profileLimits = entry.request.profile
-        ? this.profiles.get(entry.request.profile).limits
-        : {};
-      const policy = resolvePolicy(this.options, {
-        ...profileLimits,
-        ...entry.request.limits,
-      });
-      const runtime = entry.request.runtime
-        ? this.runtimes.get(entry.request.runtime)
-        : undefined;
-      const command = entry.request.command ?? runtime?.entrypoint;
-      if (!command) {
-        throw new SandboxError(
-          'POLICY_VIOLATION',
-          'A command or a runtime with an entrypoint is required',
-        );
-      }
+      requesterPromise = this.getRequester();
+      const requester = await requesterPromise;
       const result = await requester.request<WireJobResult>(
         'run',
         {
           jobId: `job-${randomUUID().replaceAll('-', '')}`,
-          rootfs: runtime?.rootfs ?? this.options.rootfs ?? '/',
-          command,
-          args: [...(entry.request.args ?? [])],
-          cwd: entry.request.cwd ?? '/',
-          env: { ...entry.request.env },
-          stdinBase64: Buffer.from(entry.request.stdin ?? '').toString('base64'),
-          limits: policy.limits,
+          ...payload,
           ...(workspace ? { workspace } : {}),
         },
         entry.request.signal,
       );
       completed = await decodeJobResult(result, workspace, entry.request.signal);
     } catch (error) {
-      if (error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE') {
-        this.requesterPromise = undefined;
-      }
       failure = error;
+      if (error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE') {
+        // A delayed failure from an old supervisor must not discard its replacement.
+        if (this.requesterPromise === requesterPromise) this.requesterPromise = undefined;
+        const requester = await requesterPromise?.catch(() => undefined);
+        if (requester) {
+          try {
+            await requester.close();
+          } catch (cleanupError) {
+            failure = new AggregateError([error, cleanupError], 'Supervisor failure and cleanup failed');
+          }
+        }
+      }
     } finally {
       try {
         if (workspace) await removeWorkspace(workspace.path);
@@ -257,8 +232,32 @@ export class Sandbox implements AsyncDisposable {
     }
   }
 
+  private resolveRunPayload(request: JobRequest) {
+    const profileLimits = request.profile ? this.profiles.get(request.profile).limits : {};
+    const policy = resolvePolicy(this.options, { ...profileLimits, ...request.limits });
+    const runtime = request.runtime ? this.runtimes.get(request.runtime) : undefined;
+    const command = request.command ?? runtime?.entrypoint;
+    if (!command) {
+      throw new SandboxError('POLICY_VIOLATION', 'A command or a runtime with an entrypoint is required');
+    }
+    const stdin = request.stdin ?? '';
+    if (Buffer.byteLength(stdin) > policy.limits.inputBytes) {
+      throw new SandboxError('POLICY_VIOLATION', 'Stdin exceeds its byte limit');
+    }
+    return {
+      rootfs: runtime?.rootfs ?? this.options.rootfs ?? '/',
+      command: normalizeGuestPath(command),
+      args: [...(request.args ?? [])],
+      cwd: normalizeGuestPath(request.cwd ?? '/', true),
+      env: { ...request.env },
+      stdinBase64: Buffer.from(stdin).toString('base64'),
+      limits: policy.limits,
+    };
+  }
+
   private getRequester(): Promise<SupervisorRequester> {
-    this.configurationLocked = true;
+    this.runtimes.lock();
+    this.profiles.lock();
     this.requesterPromise ??= this.requesterFactory();
     return this.requesterPromise;
   }
@@ -277,8 +276,11 @@ export class Sandbox implements AsyncDisposable {
     this.rejectClose = undefined;
     void (async () => {
       try {
-        if (this.requesterPromise) await (await this.requesterPromise).close();
-        if (this.ownsWorkspaceRoot) await removeWorkspaceRoot(this.workspaceRoot);
+        try {
+          if (this.requesterPromise) await (await this.requesterPromise).close();
+        } finally {
+          if (this.ownsWorkspaceRoot) await removeWorkspace(this.workspaceRoot);
+        }
         resolve();
       } catch (error) {
         reject(error);

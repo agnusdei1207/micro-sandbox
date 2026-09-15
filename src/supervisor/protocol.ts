@@ -19,10 +19,6 @@ export class FrameDecoder {
 
   push(chunk: Uint8Array): unknown[] {
     this.buffered = Buffer.concat([this.buffered, chunk]);
-    if (this.buffered.length > MAX_CONTROL_FRAME_BYTES && !this.buffered.includes(0x0a)) {
-      throw protocolError('Supervisor sent an oversized unterminated frame');
-    }
-
     const messages: unknown[] = [];
     let newline = this.buffered.indexOf(0x0a);
     while (newline !== -1) {
@@ -39,6 +35,9 @@ export class FrameDecoder {
         }
       }
       newline = this.buffered.indexOf(0x0a);
+    }
+    if (this.buffered.length > MAX_CONTROL_FRAME_BYTES) {
+      throw protocolError('Supervisor sent an oversized unterminated frame');
     }
     return messages;
   }

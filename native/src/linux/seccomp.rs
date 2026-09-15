@@ -51,6 +51,12 @@ pub fn apply_baseline() -> Result<(), SandboxError> {
         filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
     }
     filter.push(statement(BPF_LD_W_ABS, 0));
+    // The guest must not disable the launcher-death kill signal.
+    filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_prctl as u32, 0, 3));
+    filter.push(statement(BPF_LD_W_ABS, 16));
+    filter.push(jump(BPF_JMP_JEQ_K, libc::PR_SET_PDEATHSIG as u32, 0, 1));
+    filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+    filter.push(statement(BPF_LD_W_ABS, 0));
     // clone3 stores flags behind a pointer that classic seccomp BPF cannot inspect.
     filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1));
     // ENOSYS lets libc safely fall back to legacy clone for ordinary threads/processes.

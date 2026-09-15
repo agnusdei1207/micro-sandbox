@@ -2,7 +2,7 @@ use crate::artifact::{self, ArtifactManifestEntry, ValidatedWorkspace, Workspace
 use crate::config::ResourceLimits;
 use crate::error::SandboxError;
 use crate::linux::cgroup::{Cgroup, validate_job_id};
-use crate::linux::clone::{CloneOutcome, RunningChild, clone_isolated};
+use crate::linux::clone::{CloneOutcome, RunningChild, clone_isolated, wait_until_ready};
 use crate::linux::{capabilities, mount, seccomp};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -107,10 +107,12 @@ pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, Sand
         }
         CloneOutcome::Parent(parent) => {
             let pipes = pipes.into_parent();
-            let child = parent.map_current_user_and_release()?;
+            let child = parent.map_current_user_and_release(
+                started + Duration::from_millis(spec.limits.timeout_ms),
+            )?;
             wait_until_ready(
                 pipes.ready_read.as_raw_fd(),
-                &child,
+                child.pidfd(),
                 started + Duration::from_millis(spec.limits.timeout_ms),
             )?;
             supervise_child(
@@ -357,57 +359,6 @@ fn join_reader(
         .join()
         .map_err(|_| SandboxError::Security("output reader panicked".into()))?
         .map_err(SandboxError::Io)
-}
-
-fn wait_until_ready(
-    fd: RawFd,
-    child: &RunningChild,
-    deadline: Instant,
-) -> Result<(), SandboxError> {
-    let mut descriptors = [
-        libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLHUP,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: child.pidfd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(SandboxError::Security(
-                "isolated child setup timed out".into(),
-            ));
-        }
-        let timeout = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
-        // SAFETY: descriptors points to two initialized pollfd values.
-        let result =
-            unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(SandboxError::Io(error));
-        }
-        if result == 0 {
-            continue;
-        }
-        if descriptors[0].revents & libc::POLLIN != 0 {
-            let mut byte = [0_u8];
-            // SAFETY: fd is the readable setup pipe and byte is writable.
-            if unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) } == 1 && byte[0] == 1 {
-                return Ok(());
-            }
-        }
-        return Err(SandboxError::Security(
-            "isolated child failed before completing security setup".into(),
-        ));
-    }
 }
 
 fn disable_dumps() -> Result<(), SandboxError> {

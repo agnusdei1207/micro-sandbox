@@ -1,74 +1,56 @@
-# micro-sandbox architecture
+# Architecture
 
-## Scope and guarantees
+`micro-sandbox` separates caller policy, process supervision, and guest execution. It is a process/container boundary sharing the host kernel. The Node application, supervisor, runtime root, cgroup delegation, and host processes sharing the service UID are trusted; the guest command and its descendants are untrusted.
 
-`micro-sandbox` is a generic command sandbox. Callers choose the executable, runtime root, and transformation policy; the core has no file parser, sanitizer, cloud adapter, or storage dependency.
+Purpose and constraints belong to the [project intent](intents/00-project.md). Deployment and commands belong to [operations](OPERATIONS.md); [terms](GLOSSARY.md) and [audit evidence](intents/0001-audit-and-refactor.md) have separate owners.
 
-- Runtime: Linux 5.15+, cgroup v2, x86-64 or ARM64.
-- Toolchain: Node.js 24.18+ LTS, Rust 1.97.1, Edition 2024.
-- Boundary: hardened process/container isolation sharing the host kernel, not a VM.
-- Failure mode: every mandatory control fails closed; no unisolated fallback exists.
+## Module ownership
 
-The untrusted boundary is the isolated command and its descendants. The Node service, Rust supervisor, runtime root, cgroup delegation, and other host processes running as the same Unix UID are trusted. Use a dedicated service account and a private `0700` workspace root; do not share that UID with untrusted host processes.
+| Module | Responsibility | Interface |
+|---|---|---|
+| Node API (`src/api`) | Bounded FIFO admission, registry ownership, request preparation, result validation, and cleanup before settlement | `createSandbox`, `Sandbox.run/close`, runtime/profile registries |
+| Node policy (`src/policy`) | Resource and artifact defaults, override validation, ceilings, and guest path rules; no filesystem I/O | Resource/artifact policy resolution |
+| Artifact workspace (`src/artifacts`) | Disk reservation, input staging, declaration enforcement, independent manifest verification, and workspace removal | Prepared workspace and collected artifact buffers |
+| Platform and transport (`src/platform`, `src/supervisor`) | Resolve trusted binary/environment, bounded JSON frames, response correlation, cancellation, and transport shutdown | `SupervisorRequester` boundary |
+| Rust supervisor (`native/src/supervisor.rs`) | Live admission, launcher lifecycle, request correlation, cancellation, and stale-cgroup reconciliation | Version 1 `health/run/cancel/shutdown` protocol |
+| Rust resources and scheduler | Read host/ancestor resource headroom and reserve capacity within one supervisor | Capacity snapshots and RAII reservations |
+| Rust job and Linux modules | Validate launch specification, establish isolation, enforce execution limits, collect bounded streams, kill/reap, and clean cgroups | Single-threaded launcher per job |
+| Rust artifacts | Validate workspace containment, pin declared output files, inspect output tree, and hash output contents | Workspace specification to manifest |
 
-## Components and data flow
+The current maintenance intent is [0001](intents/0001-audit-and-refactor.md). Policy stays independent of filesystem I/O; the workspace does not select tools or parse caller content. The supervisor launches a fresh process before namespace creation to avoid post-fork work in its multithreaded address space.
+
+## Job and artifact flow
 
 ```text
-Node API (policy, bounded queue, runtime/profile registries)
-  ├─ bounded versioned control protocol ──> Rust supervisor
-  │                                        ├─ live cgroup admission
-  │                                        └─ guarded launcher per job
-  │                                             └─ isolated process tree
-  └─ private artifact workspace ─────────> /input (ro,noexec)
-                                           /output (rw,noexec)
+Node API -> policy + admission -> bounded control protocol -> Rust supervisor
+    |                                                        |
+    +-> private workspace                              job launcher
+          input/  -> guest /input (read-only)                 |
+          output/ -> declared writable guest files      isolated command
+    |                                                        |
+    +<- Node manifest verification <- manifest <- kill/reap + native checks
+    +-> workspace cleanup -> settle run() promise
 ```
 
-The supervisor never loads plugins or parses caller content. A fresh single-threaded launcher creates namespaces, avoiding unsafe post-fork work in the multi-threaded supervisor.
+1. Node resolves runtime/profile/resource policy and checks stdin before staging artifacts or starting the supervisor. It reserves input plus output disk budgets while a workspace is active.
+2. Node creates a random job directory, stages inputs, and pre-creates declared empty output files. Rust independently checks containment, regular files, link counts, declarations, and limits.
+3. The supervisor generates its own cgroup identifier and reserves memory/CPU/PID capacity. The launcher applies cgroup limits and uses `clone3` with `CLONE_INTO_CGROUP` and USER/PID/MNT/NET/IPC/UTS/CGROUP namespaces.
+4. The child establishes user mappings, mount isolation, a private root, explicit environment, zero capabilities, `no_new_privs`, and seccomp before executing the command.
+5. Input and output directory trees are mounted read-only and non-executable; only declared regular output files are overlaid writable. A uniform file-size limit and blocked allocation bypasses bound declared output storage. Private root and `/tmp` tmpfs storage are separate from artifact output budgets.
+6. After the guest is killed/reaped and its cgroup cleaned, Rust reads the pinned output file handles, checks sizes and filesystem allocation, and returns a manifest. Node independently opens and validates the reported files and checks required entries and hashes before returning buffers.
 
-## Policy and extensibility
+## Limits and failure ownership
 
-`Sandbox.run()` accepts a command or registered runtime, arguments, guest working directory, explicit environment, bounded stdin, resource overrides, `AbortSignal`, and optional artifacts. A runtime is only an immutable `{ rootfs, entrypoint }` mapping; profiles are reusable limit layers. This keeps ImageMagick, Sharp, LibreOffice, FFmpeg, compilers, and private tools outside the trusted core while giving all of them the same containment.
+Resource policy is package defaults, instance defaults, profile limits, then job overrides, checked against instance ceilings. Native code independently checks positivity/finite values and live admission; immutable numeric maxima apply to raw stdin/stdout and artifacts, not every resource field. Raw stdin and combined stdout/stderr have a native 512 KiB maximum. Artifact native bounds are 1 GiB and 1,024 files. Defaults are exported by the Node policy modules.
 
-Resource policy order is package defaults → instance defaults/ceilings → profile → job override. Artifact policy uses package defaults → instance defaults/ceilings → job override. Native immutable limits remain authoritative if Node-side policy is misconfigured or bypassed.
+Node queue capacity, native scheduler capacity, and disk reservations are different controls. Scheduler reservations are local to a supervisor; multiple supervisors observe shared live cgroup usage but do not share a global reservation lock. Operators must provision and budget shared deployments accordingly.
 
-Raw stdin and combined stdout/stderr have a 512 KiB native maximum. Large payloads use artifacts: default input/output totals are 16/32 MiB; configurable ceilings default to 256 MiB; the native ceiling is 1 GiB and 1,024 files. The artifact filesystem retains 20% free-space headroom and concurrent jobs reserve their declared input plus output budgets.
+RAII guards cover ordinary setup, execution, cancellation, and error paths. Parent-death signals terminate launchers and guests if their owner dies; guest seccomp prevents clearing that setting. Forced supervisor death can leave empty cgroup directories, which the next supervisor reconciles only when the recorded owner is dead. Live owners are preserved.
 
-## Artifact lifecycle
+## Filesystem and syscall boundary
 
-1. Node resolves policy, reserves disk capacity, and creates a random per-job directory beneath a dedicated workspace root.
-2. `Buffer`, `sourcePath`, and `AsyncIterable` inputs are copied with exclusive, no-follow file handles. Normalized relative POSIX paths, counts, bytes, duplicates, and cancellation are checked while staging.
-3. Rust canonicalizes the configured root and workspace, requires direct containment, rejects links and non-regular files, verifies limits, and requires an empty output directory.
-4. The launcher bind-mounts `/input` and the `/output` directory tree read-only. It then overlays only explicitly declared, pre-created regular output files as writable. All mounts are `nosuid,nodev,noexec`; the child receives no host workspace path and cannot create undeclared files or replace directories.
-5. Declared files use one uniform maximum, and their count multiplied by that maximum must fit the total output budget. `RLIMIT_FSIZE` therefore creates a kernel-enforced aggregate upper bound. Seccomp denies `fallocate` and io_uring allocation bypasses; Rust additionally scans the output tree for bytes, allocated blocks, entries, depth, links, and unsupported types.
-6. After the process tree is killed/reaped and the cgroup is removed, Rust reopens regular single-link files with `O_NOFOLLOW`, hashes them, and returns only a manifest.
-7. Node independently reopens every manifest path with `O_NOFOLLOW`, rechecks type/link/size/aggregate limits and SHA-256, reads the result, and removes the job workspace before settling the promise.
+Runtime sources must canonically remain inside the configured root. Only `bin`, `sbin`, `usr`, `lib`, and `lib64` are recursively mounted read-only, `nosuid`, and `nodev`. Host `/etc`, homes, and environment are not mounted/inherited into the guest. Safe devices are `null`, `zero`, `random`, and `urandom`.
 
-Artifact output is buffered only after successful validation. Keep limits appropriate for the service memory budget; send returned buffers to caller-owned storage promptly. MIME detection and semantic output validation remain caller responsibilities.
+The private root is a writable 16 MiB tmpfs and permits execution; `/tmp` is another 16 MiB tmpfs with `noexec`. Artifact mounts use `noexec`, which prevents direct execution from those mounts but does not stop an interpreter from reading a script. Runtime compatibility and tool selection remain caller policy.
 
-## Isolation lifecycle
-
-1. Validate protocol fields, numeric limits, paths, environment, runtime root, and workspace.
-2. Generate an opaque supervisor-owned cgroup ID and atomically reserve live capacity across delegated ancestors.
-3. Apply memory, zero-swap, CPU, and PID limits, then use `clone3` with `CLONE_INTO_CGROUP` and USER/PID/MNT/NET/IPC/UTS/CGROUP namespaces.
-4. Complete the race-free parent/child mapping handshake within the job deadline.
-5. Make mount propagation private; create a tmpfs root; recursively bind only runtime `bin`, `sbin`, `usr`, `lib`, and `lib64`; add private `/proc`, `/tmp`, and safe devices; then `pivot_root` and detach the host root.
-6. Clear capabilities, disable dumps, set `no_new_privs`, install seccomp, and `execve` with an explicit environment.
-7. Enforce timeout/cancellation with pidfds and `cgroup.kill`; drain bounded streams concurrently; read OOM events and peak memory; reap and clean all state.
-
-RAII guards converge setup, I/O, cancellation, protocol, and supervisor-failure paths on kill/reap/cleanup. Startup reconciles only stale cgroups belonging to dead supervisor owners, so live sandbox instances can share a delegated root.
-
-## Syscall and filesystem boundary
-
-Runtime mount sources must canonically remain beneath the configured root. Recursive `mount_setattr` makes nested mounts read-only, `nosuid`, and `nodev`. Host `/etc`, homes, secrets, sockets, and inherited environment are absent. `/tmp` is private and size-limited; `/dev` contains only `null`, `zero`, `random`, and `urandom`.
-
-All capability masks are zero. Seccomp denies legacy/new mount APIs, namespace reassignment and namespace-creating clone flags, ptrace, BPF, modules, keyrings, reboot, swap, kexec, perf, userfaultfd, and related high-risk calls. Networking uses a private namespace with no host interfaces or routes.
-
-This defense-in-depth boundary does not claim VM-equivalent isolation or immunity from future Linux kernel vulnerabilities. Use a VM boundary as well when processing data from adversaries that justify that threat model.
-
-## Deployment and release
-
-Create a dedicated empty cgroup-v2 subtree with `cpu`, `memory`, and `pids` delegated. With systemd, configure `Delegate=cpu memory pids`; pass the child path as `cgroupRoot` or `MICRO_SANDBOX_CGROUP_ROOT`. Put `workspaceRoot` on a private local filesystem with sufficient space; when supplied by the caller, the directory is never removed by the package.
-
-The main package can be installed by npm, pnpm, or Yarn. Optional x64/ARM64 packages contain static musl ELF binaries. Windows is supported for installation, development, and unit testing; actual jobs fail closed outside Linux.
-
-Release gates include TypeScript tests, Rustfmt, Clippy with denied warnings, Rust tests on both architectures, privileged namespace/cgroup/seccomp tests, public API integration with multi-megabyte artifacts, npm audit, static ELF validation, clean packed installation, version/tag equality, and SHA-256 checksums.
+Seccomp blocks mount/namespace manipulation, ptrace, BPF, keyrings, module operations, perf, userfaultfd, io_uring, and file-preallocation bypasses. A private network namespace has no host interfaces or routes. This is defense in depth, not VM-equivalent isolation or a guarantee against future kernel vulnerabilities.

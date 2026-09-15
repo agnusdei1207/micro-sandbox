@@ -54,7 +54,7 @@ const safeFile = result.artifacts.find((file) => file.path === 'safe.png');
 
 Validate the claimed media type before selecting a command, and validate the produced format before serving it. The sandbox contains parser compromise; it does not decide whether a transformation is semantically safe.
 
-Declared outputs share `limits.outputFileBytes`; their count multiplied by that value must fit `limits.outputBytes`. This makes the total a kernel-enforced hard bound rather than a best-effort scan.
+Declared outputs use one uniform resolved `maxBytes`, defaulting to `limits.outputFileBytes`. Their count multiplied by that maximum must fit `limits.outputBytes`, so the launcher can enforce the total with a per-file kernel limit.
 Set `required: false` for optional output slots; untouched empty optional files are omitted from the result.
 
 ## Configuration
@@ -63,6 +63,13 @@ Register caller-owned runtime roots and profiles for reusable commands and resou
 
 `cgroupRoot` must be a dedicated writable cgroup-v2 subtree with `cpu`, `memory`, and `pids` delegated. With systemd, use `Delegate=cpu memory pids`. The package never elevates privileges or falls back to unisolated execution.
 
-See [the architecture and operations guide](./docs/ARCHITECTURE.md) and the [examples](./examples).
+## Documentation
+
+- [Project intent](./docs/intents/00-project.md): purpose and long-term constraints.
+- [Architecture](./docs/ARCHITECTURE.md): module ownership and isolation boundary.
+- [Operations and verification](./docs/OPERATIONS.md): deployment, lifecycle, limits, and checks.
+- [Glossary](./docs/GLOSSARY.md): shared terms.
+- [Audit and refactoring record](./docs/intents/0001-audit-and-refactor.md): findings, changes, and verification evidence.
+- [Examples](./examples): caller-owned command recipes.
 
 MIT

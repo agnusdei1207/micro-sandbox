@@ -2,15 +2,21 @@ import { readdir, readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
+import { requirePackageTarball } from './package-artifacts.mjs';
 
 const root = JSON.parse(await readFile('package.json', 'utf8'));
 const files = await readdir('artifacts');
-for (const name of ['micro-sandbox-linux-x64', 'micro-sandbox-linux-arm64']) {
-  const tarball = files.find((file) => file.startsWith(`${name}-${root.version}`) && file.endsWith('.tgz'));
-  if (!tarball) throw new Error(`Missing tarball for ${name}`);
-  publishUnlessPresent(name, path.resolve('artifacts', tarball));
+const packages = [
+  'micro-sandbox-linux-x64',
+  'micro-sandbox-linux-arm64',
+  root.name,
+].map((name) => ({
+  name,
+  target: path.resolve('artifacts', requirePackageTarball(files, name, root.version)),
+}));
+for (const { name, target } of packages) {
+  publishUnlessPresent(name, target);
 }
-publishUnlessPresent(root.name, '.');
 
 function publishUnlessPresent(name, target) {
   if (run(['view', `${name}@${root.version}`, 'version'], true).status === 0) return;

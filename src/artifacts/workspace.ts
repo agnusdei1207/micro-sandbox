@@ -11,24 +11,6 @@ import type {
   OutputArtifact,
 } from '../types.js';
 
-export const DEFAULT_ARTIFACT_LIMITS: Readonly<ArtifactLimits> = Object.freeze({
-  inputFiles: 16,
-  inputBytes: 16 * 1024 * 1024,
-  inputFileBytes: 8 * 1024 * 1024,
-  outputFiles: 32,
-  outputBytes: 32 * 1024 * 1024,
-  outputFileBytes: 16 * 1024 * 1024,
-});
-
-export const DEFAULT_ARTIFACT_CEILINGS: Readonly<ArtifactLimits> = Object.freeze({
-  inputFiles: 128,
-  inputBytes: 256 * 1024 * 1024,
-  inputFileBytes: 256 * 1024 * 1024,
-  outputFiles: 256,
-  outputBytes: 256 * 1024 * 1024,
-  outputFileBytes: 256 * 1024 * 1024,
-});
-
 export interface ArtifactManifestEntry {
   readonly path: string;
   readonly size: number;
@@ -80,6 +62,7 @@ export async function prepareWorkspace(
       total += written;
     }
     const outputs: Array<{ path: string; maxBytes: number; required: boolean }> = [];
+    const outputPaths = new Set<string>();
     let declaredBytes = 0;
     let uniformOutputBytes: number | undefined;
     for (const output of requestedOutputs) {
@@ -96,8 +79,8 @@ export async function prepareWorkspace(
       if (declaredBytes > limits.outputBytes) {
         violation('Declared outputs exceed the aggregate output limit');
       }
-      if (targets.has(`output:${outputPath}`)) violation(`Duplicate artifact output ${outputPath}`);
-      targets.add(`output:${outputPath}`);
+      if (outputPaths.has(outputPath)) violation(`Duplicate artifact output ${outputPath}`);
+      outputPaths.add(outputPath);
       const destination = path.join(outputRoot, ...outputPath.split('/'));
       await mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
       const handle = await open(
@@ -129,6 +112,9 @@ export async function collectArtifacts(
   const declared = new Map(workspace.outputs.map((output) => [output.path, output.maxBytes]));
   let total = 0;
   for (const entry of manifest) {
+    if (!entry || typeof entry.path !== 'string' || typeof entry.sha256 !== 'string') {
+      violation('Supervisor returned an invalid artifact manifest');
+    }
     const relative = normalizeArtifactPath(entry.path);
     if (!Number.isSafeInteger(entry.size) || entry.size < 0 || !/^[a-f0-9]{64}$/.test(entry.sha256)) {
       violation('Supervisor returned an invalid artifact manifest');
@@ -169,39 +155,16 @@ export async function collectArtifacts(
       await handle.close();
     }
   }
+  for (const output of workspace.outputs) {
+    if (output.required && !paths.has(output.path)) {
+      violation(`Supervisor omitted required artifact ${output.path}`);
+    }
+  }
   return Object.freeze(artifacts);
 }
 
 export async function removeWorkspace(workspace: string): Promise<void> {
   await rm(workspace, { recursive: true, force: true });
-}
-
-export async function removeWorkspaceRoot(root: string): Promise<void> {
-  await rm(root, { recursive: true, force: true });
-}
-
-export function resolveArtifactLimits(
-  configuredDefaults: Partial<ArtifactLimits>,
-  configuredCeilings: Partial<ArtifactLimits>,
-  requested: Partial<ArtifactLimits>,
-): Readonly<ArtifactLimits> {
-  const defaults = { ...DEFAULT_ARTIFACT_LIMITS, ...configuredDefaults };
-  const ceilings = { ...DEFAULT_ARTIFACT_CEILINGS, ...configuredCeilings };
-  const limits = { ...defaults, ...requested };
-  if (requested.outputFileBytes === undefined) {
-    limits.outputFileBytes = Math.min(limits.outputFileBytes, limits.outputBytes);
-  }
-  for (const key of Object.keys(DEFAULT_ARTIFACT_LIMITS) as Array<keyof ArtifactLimits>) {
-    for (const [label, values] of [['default', defaults], ['ceiling', ceilings], ['requested', limits]] as const) {
-      if (!Number.isSafeInteger(values[key]) || values[key] <= 0) violation(`${label} artifact ${key} is invalid`);
-    }
-    if (defaults[key] > ceilings[key] || limits[key] > ceilings[key]) {
-      violation(`Artifact ${key} exceeds its ceiling`);
-    }
-  }
-  if (limits.outputFileBytes > limits.outputBytes) violation('Artifact outputFileBytes exceeds outputBytes');
-  if (limits.inputFileBytes > limits.inputBytes) violation('Artifact inputFileBytes exceeds inputBytes');
-  return Object.freeze(limits);
 }
 
 export async function reserveWorkspaceCapacity(

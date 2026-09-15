@@ -388,7 +388,7 @@ fn drain_finished(
                 match bounded_json(&output.stdout)
                     .and_then(|bytes| serde_json::from_slice(bytes).map_err(SandboxError::Json))
                 {
-                    Ok(result) => Response::success(finished.request_id, result),
+                    Ok(result) => job_success_response(finished.request_id, result),
                     Err(error) => Response::failure(finished.request_id, &error),
                 }
             }
@@ -411,6 +411,16 @@ fn cancel_all(active: &HashMap<u64, ActiveJob>, cancelled: &mut HashSet<u64>) {
     for (&request_id, job) in active {
         cancelled.insert(request_id);
         let _ = job.pidfd.send_signal(libc::SIGKILL);
+    }
+}
+
+fn job_success_response(request_id: u64, result: Value) -> Response {
+    let response = Response::success(request_id, result);
+    // Check the complete envelope before writing, so a single large result cannot
+    // terminate the supervisor and cancel unrelated jobs.
+    match encode_response(&response) {
+        Ok(_) => response,
+        Err(error) => Response::failure(request_id, &error),
     }
 }
 
@@ -542,4 +552,37 @@ fn cgroup_root() -> Result<PathBuf, SandboxError> {
         .ok_or_else(|| {
             SandboxError::CgroupUnavailable("MICRO_SANDBOX_CGROUP_ROOT is not set".into())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_success_envelope_becomes_a_correlated_job_failure() {
+        // The launcher JSON fits exactly; adding a response envelope exceeds the bound.
+        let result = json!({ "stdoutBase64": "x".repeat(MAX_FRAME_BYTES - 19) });
+        let launcher_bytes = serde_json::to_vec(&result).unwrap();
+        assert_eq!(launcher_bytes.len(), MAX_FRAME_BYTES);
+        assert!(bounded_json(&launcher_bytes).is_ok());
+
+        let response = job_success_response(41, result);
+        let mut stream = Vec::new();
+        write_response(&mut stream, &response).unwrap();
+        write_response(
+            &mut stream,
+            &job_success_response(42, json!({ "exitCode": 0 })),
+        )
+        .unwrap();
+        let responses: Vec<Value> = stream
+            .split(|byte| *byte == b'\n')
+            .filter(|frame| !frame.is_empty())
+            .map(|frame| serde_json::from_slice(frame).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["id"], 41);
+        assert_eq!(responses[0]["error"]["code"], "PROTOCOL_ERROR");
+        assert_eq!(responses[1]["id"], 42);
+        assert_eq!(responses[1]["ok"], true);
+    }
 }

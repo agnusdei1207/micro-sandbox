@@ -1,12 +1,16 @@
 import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import process from 'node:process';
+import { verifyOptionalDependencyLock } from './package-artifacts.mjs';
 
 const current = process.argv.find((argument) => argument.startsWith('--current='))?.split('=')[1];
 const packages = [
   { directory: 'npm/linux-x64', name: 'micro-sandbox-linux-x64', cpu: 'x64', machine: 0x3e },
   { directory: 'npm/linux-arm64', name: 'micro-sandbox-linux-arm64', cpu: 'arm64', machine: 0xb7 },
 ];
+if (current !== undefined && !packages.some((platform) => platform.cpu === current)) {
+  throw new Error(`Unsupported package architecture ${JSON.stringify(current)}`);
+}
 
 const root = JSON.parse(await readFile('package.json', 'utf8'));
 const version = root.version;
@@ -18,16 +22,28 @@ assert(root.exports?.['.']?.import === './dist/index.js', 'ESM export');
 assert(root.exports?.['.']?.types === './dist/index.d.ts', 'type export');
 assert(root.optionalDependencies?.['micro-sandbox-linux-x64'] === version, 'x64 dependency');
 assert(root.optionalDependencies?.['micro-sandbox-linux-arm64'] === version, 'ARM64 dependency');
-assert(root.files?.includes('docs/ARCHITECTURE.md'), 'English architecture is packaged');
+const lock = JSON.parse(await readFile('package-lock.json', 'utf8'));
+for (const [name, dependencyVersion] of Object.entries(root.optionalDependencies)) {
+  verifyOptionalDependencyLock(lock, name, dependencyVersion);
+}
+assert(root.files?.includes('docs'), 'documentation tree is packaged');
 assert(!root.files?.some((file) => file.endsWith('.ko.md')), 'translated docs are not packaged');
 
 const readme = await readFile('README.md', 'utf8');
 assert(!readme.includes('ARCHITECTURE.ko.md'), 'README has no translated-doc link');
-const markdownDocs = (await readdir('docs')).filter((file) => file.endsWith('.md'));
-assert(
-  markdownDocs.length === 1 && markdownDocs[0] === 'ARCHITECTURE.md',
-  'docs contains only the English architecture',
-);
+const markdownDocs = (await readdir('docs', { recursive: true }))
+  .filter((file) => file.endsWith('.md'))
+  .map((file) => file.replaceAll('\\', '/'));
+for (const required of [
+  'ARCHITECTURE.md',
+  'GLOSSARY.md',
+  'OPERATIONS.md',
+  'intents/00-project.md',
+  'intents/0001-audit-and-refactor.md',
+]) {
+  assert(markdownDocs.includes(required), `documentation includes ${required}`);
+}
+assert(!markdownDocs.some((file) => file.endsWith('.ko.md')), 'documentation is English-only');
 
 for (const platform of packages) {
   const manifest = JSON.parse(await readFile(`${platform.directory}/package.json`, 'utf8'));
@@ -38,7 +54,7 @@ for (const platform of packages) {
   assert(manifest.exports?.['./bin/micro-sandbox'] === './bin/micro-sandbox', `${platform.cpu} export`);
   assert(manifest.bin?.['micro-sandbox-native'] === 'bin/micro-sandbox', `${platform.cpu} executable`);
 
-  if (!process.argv.includes('--source-only') && (!current || current === platform.cpu)) {
+  if (!process.argv.includes('--source-only') && (current === undefined || current === platform.cpu)) {
     const binary = `${platform.directory}/bin/micro-sandbox`;
     await access(binary, constants.X_OK);
     const info = await stat(binary);

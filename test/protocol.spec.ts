@@ -54,3 +54,14 @@ test('FrameDecoder rejects malformed JSON and oversized unterminated input', () 
       error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
   );
 });
+
+test('FrameDecoder rejects an oversized trailing fragment after a complete frame', () => {
+  const decoder = new FrameDecoder();
+  assert.throws(
+    () => decoder.push(Buffer.concat([
+      encodeFrame({ ok: true }),
+      Buffer.alloc(MAX_CONTROL_FRAME_BYTES + 1, 0x78),
+    ])),
+    (error: unknown) => error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
+  );
+});

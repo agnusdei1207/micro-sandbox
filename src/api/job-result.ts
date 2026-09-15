@@ -4,6 +4,7 @@ import {
   type PreparedWorkspace,
 } from '../artifacts/workspace.js';
 import { SandboxError } from '../errors.js';
+import { REQUIRED_ISOLATION } from '../policy/defaults.js';
 import type { JobResult } from '../types.js';
 
 export interface WireJobResult extends Omit<JobResult, 'stdout' | 'stderr' | 'artifacts'> {
@@ -50,11 +51,7 @@ function validateWireResult(result: WireJobResult): void {
     protocolViolation('Supervisor returned an invalid job result');
   }
   const isolation = result.isolation as unknown as Record<string, unknown>;
-  for (const key of [
-    'userNamespace', 'pidNamespace', 'mountNamespace', 'networkNamespace',
-    'ipcNamespace', 'utsNamespace', 'cgroupNamespace', 'cgroupV2', 'seccomp',
-    'noNewPrivileges', 'capabilitiesDropped', 'pivotRoot',
-  ]) {
+  for (const key of Object.keys(REQUIRED_ISOLATION)) {
     if (isolation?.[key] !== true) protocolViolation(`Supervisor did not attest ${key}`);
   }
   if (

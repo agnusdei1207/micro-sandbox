@@ -137,3 +137,45 @@ fn computes_headroom_with_saturating_arithmetic() {
     assert_eq!(snapshot.memory_headroom_bytes(), Some(12));
     assert_eq!(snapshot.pid_headroom(), Some(0));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn discovers_limits_beneath_a_cgroup_root_without_resource_files() {
+    let root = tempfile::tempdir().unwrap();
+    let delegated = root.path().join("delegated");
+    std::fs::create_dir(&delegated).unwrap();
+    std::fs::write(root.path().join("cgroup.controllers"), "cpu memory pids").unwrap();
+    for (file, value) in [
+        ("cgroup.controllers", "cpu memory pids"),
+        ("memory.max", "104857600"),
+        ("memory.current", "0"),
+        ("cpu.max", "100000 100000"),
+        ("pids.max", "100"),
+        ("pids.current", "0"),
+    ] {
+        std::fs::write(delegated.join(file), value).unwrap();
+    }
+    let capacity = micro_sandbox_native::resources::detect_admission_capacity(&delegated).unwrap();
+    assert_eq!(capacity.memory_bytes, 80 * 1024 * 1024);
+    assert_eq!(capacity.cpu_millis, 800);
+    assert_eq!(capacity.pids, 80);
+
+    // A cgroup namespace root can impose tighter limits than the delegated child.
+    for (file, value) in [
+        ("memory.max", "52428800"),
+        ("memory.current", "0"),
+        ("cpu.max", "50000 100000"),
+        ("pids.max", "50"),
+        ("pids.current", "0"),
+    ] {
+        std::fs::write(root.path().join(file), value).unwrap();
+    }
+    let capacity = micro_sandbox_native::resources::detect_admission_capacity(&delegated).unwrap();
+    assert_eq!(capacity.memory_bytes, 40 * 1024 * 1024);
+    assert_eq!(capacity.cpu_millis, 400);
+    assert_eq!(capacity.pids, 40);
+
+    // A partially missing controller interface must still fail closed.
+    std::fs::remove_file(root.path().join("memory.max")).unwrap();
+    assert!(micro_sandbox_native::resources::detect_admission_capacity(&delegated).is_err());
+}

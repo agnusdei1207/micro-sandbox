@@ -6,10 +6,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn supervisor_executes_a_correlated_job_request() {
-    if !privileged() {
-        return;
-    }
     let mut supervisor = start_supervisor();
     send(
         &mut supervisor,
@@ -28,10 +26,8 @@ fn supervisor_executes_a_correlated_job_request() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn supervisor_cancels_a_running_process_tree() {
-    if !privileged() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let mut supervisor = start_supervisor();
     send(
@@ -66,10 +62,8 @@ fn supervisor_cancels_a_running_process_tree() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn a_restarted_supervisor_reconciles_jobs_left_by_a_crash() {
-    if !privileged() {
-        return;
-    }
     let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let mut supervisor = start_supervisor();
     send(
@@ -97,10 +91,70 @@ fn a_restarted_supervisor_reconciles_jobs_left_by_a_crash() {
 }
 
 #[test]
-fn a_second_live_supervisor_does_not_reconcile_the_first_supervisors_jobs() {
-    if !privileged() {
-        return;
+#[ignore = "requires the privileged Linux kernel test runner"]
+fn supervisor_crash_kills_a_guest_that_tries_to_disable_parent_death_handling() {
+    let cgroup_root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
+    let mut supervisor = start_supervisor();
+    let mut payload = spec("ignored", "", 30_000);
+    payload["command"] = json!("/usr/bin/python3");
+    payload["args"] = json!([
+        "-c",
+        r#"
+import ctypes, time
+libc = ctypes.CDLL(None)
+libc.prctl(1, 0, 0, 0, 0)
+libc.prctl(15, b'cleanup-probe', 0, 0, 0)
+time.sleep(30)
+"#
+    ]);
+    send(
+        &mut supervisor,
+        json!({
+            "version": 1, "id": 91, "type": "run", "payload": payload
+        }),
+    );
+    let job = wait_for_owned_job(std::path::Path::new(&cgroup_root), supervisor.id(), 91);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        ready = std::fs::read_to_string(job.join("cgroup.procs"))
+            .unwrap()
+            .lines()
+            .any(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .is_ok_and(|name| name.trim() == "cleanup-probe")
+            });
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
     }
+    supervisor.kill().unwrap();
+    supervisor.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut empty = false;
+    while Instant::now() < deadline {
+        empty = match std::fs::read_to_string(job.join("cgroup.procs")) {
+            Ok(pids) => pids.trim().is_empty(),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        if empty {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Clean up the probe even when a regression leaves the guest alive.
+    let _ = std::fs::write(job.join("cgroup.kill"), "1\n");
+    assert!(ready, "guest never reached its parent-death-signal probe");
+    assert!(
+        empty,
+        "guest survived the supervisor and launcher without a restart"
+    );
+}
+
+#[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
+fn a_second_live_supervisor_does_not_reconcile_the_first_supervisors_jobs() {
     let root = std::env::var("MICRO_SANDBOX_CGROUP_ROOT").unwrap();
     let mut first = start_supervisor();
     send(
@@ -135,10 +189,8 @@ fn a_second_live_supervisor_does_not_reconcile_the_first_supervisors_jobs() {
 }
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn supervisor_ignores_caller_job_ids_and_uses_an_owned_identifier() {
-    if !privileged() {
-        return;
-    }
     let mut supervisor = start_supervisor();
     send(
         &mut supervisor,
@@ -242,8 +294,4 @@ fn decode(value: &Value) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(value.as_str().unwrap())
         .unwrap()
-}
-
-fn privileged() -> bool {
-    std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_some()
 }

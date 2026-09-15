@@ -4,10 +4,8 @@ use serde_json::Value;
 use std::process::Command;
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn creates_all_required_namespaces_and_disconnects_network() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let output = Command::new(env!("CARGO_BIN_EXE_micro-sandbox"))
         .arg("namespace-probe")
         .output()

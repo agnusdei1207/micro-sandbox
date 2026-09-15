@@ -59,6 +59,7 @@ jobs:
           pattern: platform-*
           path: artifacts
           merge-multiple: true
+      - run: sha256sum --check artifacts/SHA256SUMS-x64 artifacts/SHA256SUMS-arm64
       - run: npm ci
       - run: npm run release:verify
       - run: node scripts/publish-if-missing.mjs

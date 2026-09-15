@@ -2,6 +2,9 @@ import { spawnSync } from 'node:child_process';
 import process from 'node:process';
 
 const mode = process.argv[2] ?? 'test';
+if (!['test', 'kernel', 'integration'].includes(mode)) {
+  throw new Error(`Unsupported native test mode ${mode}`);
+}
 const cwd = process.cwd();
 const common = ['run', '--rm', '-e', 'CARGO_BUILD_JOBS=2', '-v', `${cwd}:/work`, '-w', '/work'];
 const args = mode === 'kernel'

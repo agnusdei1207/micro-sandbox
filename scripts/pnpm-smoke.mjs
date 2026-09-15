@@ -1,18 +1,32 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { packageTarballName } from './package-artifacts.mjs';
+import { createInstalledPackageProbe } from './smoke-probe.mjs';
 
 const arch = process.argv.find((value) => value.startsWith('--current='))?.split('=')[1] ?? 'x64';
 if (!['x64', 'arm64'].includes(arch)) throw new Error(`Unsupported pnpm smoke architecture ${arch}`);
 const platform = arch === 'x64' ? 'amd64' : 'arm64';
 const manifest = JSON.parse(await readFile('package.json', 'utf8'));
-const main = `agnusdei12071207-micro-sandbox-${manifest.version}.tgz`;
-const native = `micro-sandbox-linux-${arch}-${manifest.version}.tgz`;
-const probe = `const api=await import('@agnusdei12071207/micro-sandbox');if(typeof api.createSandbox!=='function')process.exit(1)`;
+const main = packageTarballName(manifest.name, manifest.version);
+const native = packageTarballName(`micro-sandbox-linux-${arch}`, manifest.version);
+const binary = await readFile(`npm/linux-${arch}/bin/micro-sandbox`);
+const expectedSha256 = createHash('sha256').update(binary).digest('hex');
+const probe = createInstalledPackageProbe(arch, manifest.version, expectedSha256);
+const projectManifest = JSON.stringify({
+  private: true,
+  type: 'module',
+});
+const workspaceConfig = `overrides:\n  "micro-sandbox-linux-${arch}": "file:/artifacts/${native}"\n`;
+const setupProject = [
+  `require('fs').writeFileSync('/tmp/smoke/package.json', ${JSON.stringify(projectManifest)})`,
+  `require('fs').writeFileSync('/tmp/smoke/pnpm-workspace.yaml', ${JSON.stringify(workspaceConfig)})`,
+].join(';');
 const command = [
   'mkdir -p /tmp/smoke',
-  `node -e ${quote("require('fs').writeFileSync('/tmp/smoke/package.json', JSON.stringify({private:true,type:'module'}))")}`,
+  `node -e ${quote(setupProject)}`,
   'cd /tmp/smoke',
   'corepack enable',
   `pnpm add --ignore-scripts /artifacts/${main} /artifacts/${native}`,

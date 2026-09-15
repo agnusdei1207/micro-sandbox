@@ -2,6 +2,7 @@ use crate::error::SandboxError;
 use std::fs;
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::time::Instant;
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -130,15 +131,13 @@ impl NamespaceParent {
         self.pid
     }
 
-    pub fn map_current_user_and_release(self) -> Result<RunningChild, SandboxError> {
-        let mut armed = [0_u8];
-        // SAFETY: armed_fd is readable and armed points to one writable byte.
-        if unsafe { libc::read(raw_fd(&self.armed_fd), armed.as_mut_ptr().cast(), 1) } != 1
-            || armed[0] != 1
+    pub fn map_current_user_and_release(
+        self,
+        deadline: Instant,
+    ) -> Result<RunningChild, SandboxError> {
+        if let Err(error) = wait_until_ready(raw_fd(&self.armed_fd), raw_fd(&self.pidfd), deadline)
         {
-            return self.fail(SandboxError::Security(
-                "isolated child did not arm parent-death handling".into(),
-            ));
+            return self.fail(error);
         }
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -304,4 +303,97 @@ fn reap(pid: i32) {
 fn raw_fd(fd: &OwnedFd) -> RawFd {
     use std::os::fd::AsRawFd;
     fd.as_raw_fd()
+}
+
+pub(crate) fn wait_until_ready(
+    fd: RawFd,
+    pidfd: RawFd,
+    deadline: Instant,
+) -> Result<(), SandboxError> {
+    let mut descriptors = [
+        libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SandboxError::Security(
+                "isolated child setup timed out".into(),
+            ));
+        }
+        let timeout = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+        // SAFETY: descriptors points to two initialized pollfd values.
+        let result =
+            unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(SandboxError::Io(error));
+        }
+        if result == 0 {
+            continue;
+        }
+        if descriptors[0].revents & libc::POLLIN != 0 {
+            let mut byte = [0_u8];
+            // SAFETY: fd is the readable setup pipe and byte is writable.
+            if unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) } == 1 && byte[0] == 1 {
+                return Ok(());
+            }
+        }
+        return Err(SandboxError::Security(
+            "isolated child failed before completing security setup".into(),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn mapping_handshake_obeys_deadline_when_child_never_arms() {
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        // SAFETY: pidfd_open takes scalar arguments and returns a new owned descriptor.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        assert!(descriptor >= 0);
+        // SAFETY: descriptor was returned by a successful pidfd_open above.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let (armed, stalled_writer) = UnixStream::pair().unwrap();
+        let (release, _reader) = UnixStream::pair().unwrap();
+        let parent = NamespaceParent {
+            pid,
+            pidfd,
+            release_fd: release.into(),
+            armed_fd: armed.into(),
+        };
+        // Bound the regression itself: the old blocking read wakes after one second.
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            drop(stalled_writer);
+        });
+        let started = Instant::now();
+        let result = parent.map_current_user_and_release(started + Duration::from_millis(20));
+        // The namespace guard already reaps on failure; consume the std handle too.
+        let _ = child.wait();
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "mapping exceeded its setup deadline"
+        );
+        watchdog.join().unwrap();
+    }
 }

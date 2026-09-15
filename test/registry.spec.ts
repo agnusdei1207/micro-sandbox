@@ -45,3 +45,11 @@ test('ProfileRegistry derives a profile without mutating its base', () => {
   assert.equal(profile.limits.pids, 8);
   assert.equal(registry.get('base').limits.memoryMb, 256);
 });
+
+test('RuntimeRegistry applies the same guest path rules as direct commands', () => {
+  for (const entrypoint of ['/proc/self/exe', '/bin/../secret', '/bin/bad\0name', '/']) {
+    assert.throws(() => new RuntimeRegistry().register({
+      id: 'tool', rootfs: '/opt/tool', entrypoint,
+    }), { code: 'POLICY_VIOLATION' }, entrypoint);
+  }
+});

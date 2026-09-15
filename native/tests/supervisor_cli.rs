@@ -3,10 +3,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
 fn supervisor_answers_health_and_exits_on_shutdown() {
-    if std::env::var_os("MICRO_SANDBOX_PRIVILEGED_TESTS").is_none() {
-        return;
-    }
     let mut child = Command::new(env!("CARGO_BIN_EXE_micro-sandbox"))
         .arg("supervise")
         .stdin(Stdio::piped())

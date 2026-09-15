@@ -7,8 +7,11 @@ const platforms = [
   { npmArch: 'x64', dockerArch: 'amd64' },
   { npmArch: 'arm64', dockerArch: 'arm64' },
 ];
+if (current !== undefined && !platforms.some((platform) => platform.npmArch === current)) {
+  throw new Error(`Unsupported build architecture ${JSON.stringify(current)}`);
+}
 for (const platform of platforms) {
-  if (current && current !== platform.npmArch) continue;
+  if (current !== undefined && current !== platform.npmArch) continue;
   run([
     'run', '--rm', '--platform', `linux/${platform.dockerArch}`, '-v', mount, '-w', '/work',
     'rust:1.97.1-alpine', 'sh', '-c',

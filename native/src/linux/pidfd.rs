@@ -31,7 +31,11 @@ impl PidFd {
             )
         };
         if result == -1 {
-            return Err(SandboxError::Io(io::Error::last_os_error()));
+            let error = io::Error::last_os_error();
+            // The waiter may reap a completed launcher before cancellation is drained.
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(SandboxError::Io(error));
+            }
         }
         Ok(())
     }

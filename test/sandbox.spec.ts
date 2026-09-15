@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -381,6 +381,153 @@ test('Sandbox restarts a crashed supervisor for the next request', async () => {
   await new Promise((resolve) => setImmediate(resolve));
   healthy.completions[0](wireResult('ok'));
   assert.equal((await recovered).stdout.toString(), 'ok');
+  assert.equal(starts, 2);
+  await sandbox.close();
+});
+
+test('Sandbox waits for failed supervisor cleanup before releasing its job', async () => {
+  let release!: () => void;
+  let closeCalls = 0;
+  const sandbox = new Sandbox({}, async () => ({
+    request: async () => { throw new SandboxError('SUPERVISOR_UNAVAILABLE', 'pipe failed'); },
+    close: () => {
+      closeCalls += 1;
+      return new Promise<void>((resolve) => { release = resolve; });
+    },
+  }));
+  let settled = false;
+  const pending = sandbox.run({ command: '/bin/true' });
+  const checked = assert.rejects(pending, { code: 'SUPERVISOR_UNAVAILABLE' });
+  void pending.catch(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeCalls, 1);
+  assert.equal(settled, false);
+  release();
+  await checked;
+  await sandbox.close();
+});
+
+test('Sandbox removes its owned workspace root even if supervisor close fails', async () => {
+  let workspace = '';
+  const closeError = new Error('close failed');
+  const sandbox = new Sandbox({}, async () => ({
+    request: async (_type, payload) => {
+      workspace = (payload as { workspace: { path: string } }).workspace.path;
+      return wireResult();
+    },
+    close: async () => { throw closeError; },
+  }));
+  await sandbox.run({ command: '/bin/true', artifacts: {} });
+  await assert.rejects(sandbox.close(), closeError);
+  await assert.rejects(stat(path.dirname(workspace)), { code: 'ENOENT' });
+});
+
+test('Sandbox rejects a manifest that omits a required output and cleans the workspace', async () => {
+  let workspace = '';
+  const sandbox = new Sandbox({}, async () => ({
+    request: async (_type, payload) => {
+      workspace = (payload as { workspace: { path: string } }).workspace.path;
+      return wireResult();
+    },
+    close: async () => {},
+  }));
+  try {
+    await assert.rejects(sandbox.run({
+      command: '/bin/true', artifacts: { outputs: [{ path: 'required.bin' }] },
+    }), { code: 'POLICY_VIOLATION' });
+    await assert.rejects(stat(workspace), { code: 'ENOENT' });
+  } finally {
+    await sandbox.close();
+  }
+});
+
+test('Sandbox registry access cannot bypass the configuration lock', async () => {
+  const sandbox = new Sandbox({}, async () => ({
+    request: async () => wireResult(), close: async () => {},
+  }));
+  await sandbox.run({ command: '/bin/true' });
+  try {
+    assert.throws(() => sandbox.runtimes.register({
+      id: 'late', rootfs: '/', entrypoint: '/bin/true',
+    }), { code: 'POLICY_VIOLATION' });
+    assert.throws(() => sandbox.profiles.define('late', {}), { code: 'POLICY_VIOLATION' });
+  } finally {
+    await sandbox.close();
+  }
+});
+
+test('Sandbox validates policy before starting the supervisor or consuming artifact inputs', async () => {
+  let starts = 0;
+  let consumed = false;
+  const sandbox = new Sandbox({}, async () => {
+    starts += 1;
+    return { request: async () => wireResult(), close: async () => {} };
+  });
+  try {
+    await assert.rejects(sandbox.run({
+      command: '/bin/true', limits: { timeoutMs: -1 },
+      artifacts: { inputs: [{ target: 'input', iterable: async function* () {
+        consumed = true;
+        yield 'data';
+      } }] },
+    }), { code: 'POLICY_VIOLATION' });
+    assert.equal(starts, 0);
+    assert.equal(consumed, false);
+  } finally {
+    await sandbox.close();
+  }
+});
+
+test('Sandbox enforces stdin byte policy before sending a request', async () => {
+  let starts = 0;
+  const sandbox = new Sandbox({}, async () => {
+    starts += 1;
+    return { request: async () => wireResult(), close: async () => {} };
+  });
+  try {
+    await assert.rejects(sandbox.run({
+      command: '/bin/true', stdin: '한', limits: { inputBytes: 2 },
+    }), { code: 'POLICY_VIOLATION' });
+    assert.equal(starts, 0);
+  } finally {
+    await sandbox.close();
+  }
+});
+
+test('Sandbox decodes stdout at the native 512 KiB ceiling', async () => {
+  const output = 'x'.repeat(512 * 1024);
+  const sandbox = new Sandbox({}, async () => ({
+    request: async () => wireResult(output), close: async () => {},
+  }));
+  try {
+    const result = await sandbox.run({ command: '/bin/true', limits: { outputBytes: 512 * 1024 } });
+    assert.equal(result.stdout.toString(), output);
+  } finally {
+    await sandbox.close();
+  }
+});
+
+test('a delayed old supervisor failure cannot discard a healthy replacement', async () => {
+  const failures: Array<(error: Error) => void> = [];
+  let starts = 0;
+  const sandbox = new Sandbox({ capacity: { maxInFlight: 2 } }, async () => {
+    starts += 1;
+    return starts === 1 ? {
+      request: () => new Promise((_resolve, reject) => { failures.push(reject); }),
+      close: async () => {},
+    } : { request: async () => wireResult('recovered'), close: async () => {} };
+  });
+  const first = sandbox.run({ command: '/bin/true' });
+  const second = sandbox.run({ command: '/bin/true' });
+  const firstChecked = assert.rejects(first, { code: 'SUPERVISOR_UNAVAILABLE' });
+  const secondChecked = assert.rejects(second, { code: 'SUPERVISOR_UNAVAILABLE' });
+  await new Promise((resolve) => setImmediate(resolve));
+  failures[0](new SandboxError('SUPERVISOR_UNAVAILABLE', 'old failure'));
+  await firstChecked;
+  assert.equal((await sandbox.run({ command: '/bin/true' })).stdout.toString(), 'recovered');
+  failures[1](new SandboxError('SUPERVISOR_UNAVAILABLE', 'delayed old failure'));
+  await secondChecked;
+  await sandbox.run({ command: '/bin/true' });
   assert.equal(starts, 2);
   await sandbox.close();
 });

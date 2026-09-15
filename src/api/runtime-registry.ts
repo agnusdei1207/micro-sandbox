@@ -1,13 +1,20 @@
 import path from 'node:path';
 import { SandboxError } from '../errors.js';
+import { normalizeGuestPath } from '../policy/paths.js';
 import type { RuntimeDefinition } from '../types.js';
 
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62})$/;
 
 export class RuntimeRegistry {
   private readonly runtimes = new Map<string, Readonly<RuntimeDefinition>>();
+  private locked = false;
+
+  lock(): void {
+    this.locked = true;
+  }
 
   register(definition: RuntimeDefinition): Readonly<RuntimeDefinition> {
+    if (this.locked) throw policyError('Runtimes must be registered before the supervisor starts');
     if (!ID_PATTERN.test(definition.id)) {
       throw policyError('Runtime ID is invalid', { id: definition.id });
     }
@@ -17,9 +24,7 @@ export class RuntimeRegistry {
     if (!path.isAbsolute(definition.rootfs)) {
       throw policyError('Runtime rootfs must be an absolute host path');
     }
-    if (!path.posix.isAbsolute(definition.entrypoint)) {
-      throw policyError('Runtime entrypoint must be an absolute guest path');
-    }
+    normalizeGuestPath(definition.entrypoint);
 
     const runtime = Object.freeze({
       ...definition,

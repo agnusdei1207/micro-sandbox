@@ -5,8 +5,16 @@ const ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62})$/;
 
 export class ProfileRegistry {
   private readonly profiles = new Map<string, Readonly<ResolvedProfile>>();
+  private locked = false;
+
+  lock(): void {
+    this.locked = true;
+  }
 
   define(name: string, definition: ProfileDefinition): Readonly<ResolvedProfile> {
+    if (this.locked) {
+      throw new SandboxError('POLICY_VIOLATION', 'Profiles must be defined before the supervisor starts');
+    }
     if (!ID_PATTERN.test(name) || this.profiles.has(name)) {
       throw new SandboxError('POLICY_VIOLATION', 'Profile name is invalid or already used', {
         name,

@@ -65,7 +65,9 @@ fn namespace_probe() -> Result<(), SandboxError> {
 
     match clone_isolated(None)? {
         CloneOutcome::Parent(parent) => {
-            let child = parent.map_current_user_and_release()?;
+            let child = parent.map_current_user_and_release(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )?;
             let status = child.wait()?;
             if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
                 return Err(SandboxError::Security(format!(

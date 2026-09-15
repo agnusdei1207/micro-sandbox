@@ -139,3 +139,47 @@ test('resolveSupervisorBinary rejects unsupported platforms and accepts an expli
     '/safe/micro-sandbox',
   );
 });
+
+test('SupervisorClient closes the transport after failure and concurrent close calls wait', async () => {
+  const transport = new FakeTransport();
+  let release!: () => void;
+  let closeCalls = 0;
+  transport.close = () => {
+    closeCalls += 1;
+    return new Promise<void>((resolve) => { release = resolve; });
+  };
+  const client = new SupervisorClient(transport);
+  transport.fail();
+  let completed = 0;
+  const first = client.close().then(() => { completed += 1; });
+  const second = client.close().then(() => { completed += 1; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeCalls, 1, 'a failed client still owns its transport');
+  assert.equal(completed, 0, 'every close caller must wait for transport cleanup');
+  release();
+  await Promise.all([first, second]);
+  assert.equal(completed, 2);
+});
+
+test('SupervisorClient retains cancelled jobs until cleanup when cancellation cannot be sent', async () => {
+  const transport = new FakeTransport();
+  let release!: () => void;
+  let closes = 0;
+  transport.close = () => {
+    closes += 1;
+    return new Promise<void>((resolve) => { release = resolve; });
+  };
+  const client = new SupervisorClient(transport);
+  const controller = new AbortController();
+  const pending = client.request('run', {}, controller.signal);
+  const checked = assert.rejects(pending, { code: 'SUPERVISOR_UNAVAILABLE' });
+  let settled = false;
+  void pending.catch(() => { settled = true; });
+  transport.send = () => { throw new SandboxError('CAPACITY_EXCEEDED', 'write queue full'); };
+  controller.abort();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closes, 1, 'an undeliverable cancellation must terminate the supervisor');
+  assert.equal(settled, false, 'workspace ownership must remain until cleanup completes');
+  release();
+  await checked;
+});
