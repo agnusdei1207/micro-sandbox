@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag matching the selected branch package version'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -28,7 +34,9 @@ jobs:
           node-version: 24.18.0
           registry-url: https://registry.npmjs.org
       - run: npm ci
-      - run: npm run release:verify
+      - run: npm run release:verify -- "$RELEASE_TAG"
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       - run: npm run test
       - run: npm run test:native
       - run: npm audit --audit-level=moderate
@@ -60,8 +68,12 @@ jobs:
           path: artifacts
           merge-multiple: true
       - run: sha256sum --check artifacts/SHA256SUMS-x64 artifacts/SHA256SUMS-arm64
-      - run: npm ci
-      - run: npm run release:verify
+      - run: npm run release:verify -- "$RELEASE_TAG"
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      - run: npm whoami
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: node scripts/publish-if-missing.mjs
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

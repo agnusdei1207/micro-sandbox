@@ -4,6 +4,17 @@ import { test } from 'node:test';
 import { spawnSync } from 'node:child_process';
 import { verifyOptionalDependencyLock } from '../scripts/package-artifacts.mjs';
 
+test('manual release tag is validated independently of the workflow branch', () => {
+  const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+  for (const [tag, succeeds] of [[`v${version}`, true], ['v999.0.0', false]] as const) {
+    const result = spawnSync(process.execPath, ['scripts/verify-release.mjs', tag], {
+      encoding: 'utf8',
+      env: { ...process.env, GITHUB_REF_NAME: 'main' },
+    });
+    assert.equal(result.status === 0, succeeds, `${result.stdout}\n${result.stderr}`);
+  }
+});
+
 test('release metadata and platform package contracts verify', () => {
   const result = spawnSync(process.execPath, ['scripts/verify-package.mjs', '--source-only'], {
     encoding: 'utf8',

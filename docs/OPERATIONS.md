@@ -74,6 +74,10 @@ npm run release:publish-local -- --main-only --dry-run
 
 This prepares a fresh main-package tarball in `artifacts/` without authentication or publication. Use `--all --dry-run` to prepare all three packages after building both native binaries. The local publication helper stages all selected packages before publishing those exact tarballs; it does not reuse cached tarballs. The hosted release workflow publishes its tested artifacts after checksum verification. A synchronized new version is needed to publish these changes; an existing registry version cannot be replaced.
 
+GitHub Actions does not read a developer's `.bashrc`. Store the npm token as `NPM_TOKEN` in this repository's `npm` environment. The publication job checks authentication explicitly, including reruns where all packages already exist. Its scripts use Node built-ins and do not need dependency installation.
+
+After publication, refresh optional-dependency metadata with `npm install --package-lock-only --ignore-scripts` and commit the lockfile. Unpublished placeholders stop satisfying `npm ci` once those versions become available. To recover on the updated branch without moving a published tag, manually run the Release workflow with the matching tag (for example, `v0.0.6`); it reruns both architecture gates and skips packages already published.
+
 ## Failure diagnosis
 
 | Failure | First check |

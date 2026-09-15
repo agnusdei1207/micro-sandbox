@@ -3,7 +3,7 @@ import process from 'node:process';
 
 const root = JSON.parse(await readFile('package.json', 'utf8'));
 const expectedTag = `v${root.version}`;
-const tag = process.env.GITHUB_REF_NAME ?? process.argv[2];
+const tag = process.argv[2] ?? process.env.GITHUB_REF_NAME;
 if (tag !== expectedTag) {
   throw new Error(`Release tag ${JSON.stringify(tag)} must equal ${expectedTag}`);
 }
