@@ -1,22 +1,34 @@
-import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import process from 'node:process';
 import { gunzipSync } from 'node:zlib';
+import { run, runNpm } from './lib/exec.mjs';
+import { IMAGES } from './lib/platforms.mjs';
+
+// Packs `directory` into `destination` and returns the absolute tarball path.
+// Windows npm drops the executable bit, so platform packages are packed inside
+// Linux there; every platform tarball must carry a 0755 native executable.
+export function packTarball(directory, destination, { platform = false } = {}) {
+  const result = platform && process.platform === 'win32'
+    ? packPlatformInLinux(directory, destination)
+    : runNpm(['pack', directory, '--pack-destination', destination, '--json'], {
+      capture: true,
+      label: `npm pack ${directory}`,
+    });
+  const [{ filename }] = JSON.parse(result.stdout);
+  const tarball = path.resolve(destination, filename);
+  if (platform) assertPlatformTarballExecutable(readFileSync(tarball));
+  return tarball;
+}
 
 export function packPlatformInLinux(directory, destination) {
-  const result = spawnSync('docker', [
+  return run('docker', [
     'run', '--rm',
     '-v', `${path.resolve(directory)}:/source:ro`,
     '-v', `${path.resolve(destination)}:/artifacts`,
-    'node:24.18.0-bookworm', 'bash', '-c',
+    IMAGES.nodeBookworm, 'bash', '-c',
     'mkdir -p /tmp/micro-sandbox-package && cp -a /source/. /tmp/micro-sandbox-package/ && find /tmp/micro-sandbox-package -type d -exec chmod 755 {} + && find /tmp/micro-sandbox-package -type f -exec chmod 644 {} + && chmod 755 /tmp/micro-sandbox-package/bin/micro-sandbox && npm pack /tmp/micro-sandbox-package --pack-destination /artifacts --json',
-  ], { encoding: 'utf8', shell: false });
-  if (result.error) throw result.error;
-  if (result.status === 0) {
-    const [{ filename }] = JSON.parse(result.stdout);
-    assertPlatformTarballExecutable(readFileSync(path.join(destination, filename)));
-  }
-  return result;
+  ], { capture: true, label: `docker platform pack ${directory}` });
 }
 
 export function assertPlatformTarballExecutable(compressedTarball) {
