@@ -9,6 +9,10 @@ export const LIMIT_KEYS = Object.freeze(
   Object.keys(DEFAULT_LIMITS) as Array<keyof ResourceLimits>,
 );
 
+/** Mirrors the native CPU quota bounds (1 ms per 100 ms period up to 1024 CPUs). */
+const CPU_MIN = 0.01;
+const CPU_MAX = 1024;
+
 const INTEGER_FIELDS = new Set<keyof ResourceLimits>([
   'timeoutMs',
   'memoryMb',
@@ -58,6 +62,9 @@ function validateLimit(label: string, field: keyof ResourceLimits, value: unknow
       `${label}.${field} must be a positive finite${INTEGER_FIELDS.has(field) ? ' integer' : ''}`,
       { field, value },
     );
+  }
+  if (field === 'cpu' && (value < CPU_MIN || value > CPU_MAX)) {
+    throw policyError(`${label}.cpu must be between ${CPU_MIN} and ${CPU_MAX}`, { field, value });
   }
 }
 

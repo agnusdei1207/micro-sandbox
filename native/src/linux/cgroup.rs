@@ -236,7 +236,10 @@ fn verify_cgroup2(root: &Path) -> Result<(), SandboxError> {
     }
     // SAFETY: statfs initialized `stats` after returning success.
     let stats = unsafe { stats.assume_init() };
-    if stats.f_type as u64 != CGROUP2_SUPER_MAGIC as u64 {
+    // `f_type` is signed on glibc and unsigned on musl; the cast is only a no-op on some targets.
+    #[allow(clippy::unnecessary_cast)]
+    let f_type = stats.f_type as u64;
+    if f_type != CGROUP2_SUPER_MAGIC as u64 {
         return Err(SandboxError::CgroupUnavailable(format!(
             "{} is not a cgroup v2 filesystem",
             root.display()
