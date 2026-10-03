@@ -1,9 +1,9 @@
 use crate::error::SandboxError;
+use crate::linux::paths::path_cstring;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -53,11 +53,16 @@ pub struct ValidatedWorkspace {
     pub input: PathBuf,
     pub output: PathBuf,
     pub outputs: Vec<ValidatedOutput>,
+    /// Uniform per-file maximum of the declared outputs, applied as `RLIMIT_FSIZE`.
+    pub file_size_limit: Option<u64>,
 }
 
 pub struct ValidatedOutput {
-    pub relative: PathBuf,
+    /// Validated relative path: UTF-8, normalized, and free of backslashes.
+    pub relative: String,
+    /// Canonical host path used as the bind-mount source.
     pub host: PathBuf,
+    /// Pinned handle to the declared file; the guest mount must resolve to this inode.
     pub handle: File,
     pub max_bytes: u64,
     pub required: bool,
@@ -65,6 +70,34 @@ pub struct ValidatedOutput {
 
 pub fn validate_workspace(spec: &WorkspaceSpec) -> Result<ValidatedWorkspace, SandboxError> {
     validate_limits(spec.limits)?;
+    let workspace = resolve_workspace(spec)?;
+    let input = contained_directory(&workspace, "input")?;
+    let output = contained_directory(&workspace, "output")?;
+    validate_private_directory(&workspace, "workspace")?;
+    inspect_tree(
+        &input,
+        spec.limits.input_files,
+        spec.limits.input_bytes,
+        spec.limits.input_file_bytes,
+        false,
+    )?;
+    let outputs = validate_declared_outputs(&output, &spec.outputs, spec.limits)?;
+    Ok(ValidatedWorkspace {
+        input,
+        output,
+        file_size_limit: outputs.first().map(|output| output.max_bytes),
+        outputs,
+    })
+}
+
+/// Resolves the workspace output directory without inspecting either artifact tree.
+///
+/// The supervisor uses this for disk admission; the launcher performs full validation.
+pub fn resolve_output_directory(spec: &WorkspaceSpec) -> Result<PathBuf, SandboxError> {
+    contained_directory(&resolve_workspace(spec)?, "output")
+}
+
+fn resolve_workspace(spec: &WorkspaceSpec) -> Result<PathBuf, SandboxError> {
     let configured_root = std::env::var_os("MICRO_SANDBOX_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .ok_or_else(|| SandboxError::PolicyViolation("workspace root is not configured".into()))?;
@@ -82,22 +115,7 @@ pub fn validate_workspace(spec: &WorkspaceSpec) -> Result<ValidatedWorkspace, Sa
             "workspace escapes its configured root".into(),
         ));
     }
-    let input = contained_directory(&workspace, "input")?;
-    let output = contained_directory(&workspace, "output")?;
-    validate_private_directory(&workspace, "workspace")?;
-    inspect_tree(
-        &input,
-        spec.limits.input_files,
-        spec.limits.input_bytes,
-        spec.limits.input_file_bytes,
-        false,
-    )?;
-    let outputs = validate_declared_outputs(&output, &spec.outputs, spec.limits)?;
-    Ok(ValidatedWorkspace {
-        input,
-        output,
-        outputs,
-    })
+    Ok(workspace)
 }
 
 pub fn collect_outputs(
@@ -113,16 +131,6 @@ pub fn collect_outputs(
     )?;
     let mut manifest = Vec::with_capacity(workspace.outputs.len());
     for output in &workspace.outputs {
-        let relative = output
-            .relative
-            .to_str()
-            .ok_or_else(|| SandboxError::PolicyViolation("artifact path is not UTF-8".into()))?
-            .to_owned();
-        if relative.contains('\\') {
-            return Err(SandboxError::PolicyViolation(
-                "artifact paths may not contain backslashes".into(),
-            ));
-        }
         let mut file = output.handle.try_clone().map_err(|error| {
             SandboxError::Security(format!("clone pinned artifact output: {error}"))
         })?;
@@ -149,7 +157,7 @@ pub fn collect_outputs(
             hash.update(&buffer[..read]);
         }
         manifest.push(ArtifactManifestEntry {
-            path: relative,
+            path: output.relative.clone(),
             size: metadata.len(),
             sha256: format!("{:x}", hash.finalize()),
         });
@@ -216,16 +224,16 @@ fn validate_declared_outputs(
             || !canonical.starts_with(root)
             || outputs
                 .iter()
-                .any(|existing: &ValidatedOutput| existing.relative == relative)
+                .any(|existing: &ValidatedOutput| existing.relative == item.path)
         {
             return Err(SandboxError::PolicyViolation(
                 "declared artifact output is unsafe".into(),
             ));
         }
         outputs.push(ValidatedOutput {
-            relative: relative.to_path_buf(),
-            host: canonical,
+            relative: item.path.clone(),
             handle: open_path(&host, libc::O_RDWR)?,
+            host: canonical,
             max_bytes,
             required: item.required,
         });
@@ -258,8 +266,7 @@ pub fn validate_outputs(
 }
 
 pub fn available_bytes(path: &Path) -> Result<u64, SandboxError> {
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| SandboxError::PolicyViolation("workspace path contains NUL".into()))?;
+    let path = path_cstring(path)?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: path is NUL-terminated and stats points to writable storage.
     if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } == -1 {
@@ -432,11 +439,10 @@ mod tests {
 
     fn workspace(root: &Path, output: PathBuf, declared: Option<&str>) -> ValidatedWorkspace {
         let outputs = declared.map_or_else(Vec::new, |name| {
-            let host = output.join(name);
             vec![ValidatedOutput {
-                relative: PathBuf::from(name),
-                handle: open_path(&host, libc::O_RDWR).unwrap(),
-                host,
+                relative: name.to_owned(),
+                handle: open_path(&output.join(name), libc::O_RDWR).unwrap(),
+                host: output.join(name),
                 max_bytes: 1024,
                 required: true,
             }]
@@ -444,7 +450,35 @@ mod tests {
         ValidatedWorkspace {
             input: root.to_path_buf(),
             output,
+            file_size_limit: outputs.first().map(|output| output.max_bytes),
             outputs,
+        }
+    }
+
+    fn declared(path: &str, max_bytes: Option<u64>) -> DeclaredOutput {
+        DeclaredOutput {
+            path: path.into(),
+            max_bytes,
+            required: true,
+        }
+    }
+
+    fn output_root(files: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let output = fs::canonicalize(root.path()).unwrap();
+        for file in files {
+            fs::write(output.join(file), b"").unwrap();
+        }
+        (root, output)
+    }
+
+    fn rejection(output: &Path, declared: &[DeclaredOutput]) -> String {
+        match validate_declared_outputs(output, declared, limits()) {
+            Ok(_) => panic!("declared outputs were accepted"),
+            Err(error) => {
+                assert_eq!(error.code(), "POLICY_VIOLATION", "{error}");
+                error.to_string()
+            }
         }
     }
 
@@ -469,5 +503,61 @@ mod tests {
         symlink("/etc/passwd", output.join("leak")).unwrap();
         let workspace = workspace(root.path(), output, None);
         assert!(collect_outputs(&workspace, limits()).is_err());
+    }
+
+    #[test]
+    fn accepts_empty_declared_outputs_with_one_uniform_maximum() {
+        let (_root, output) = output_root(&["a.txt", "b.txt"]);
+        let outputs = validate_declared_outputs(
+            &output,
+            &[declared("a.txt", Some(256)), declared("b.txt", Some(256))],
+            limits(),
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].relative, "a.txt");
+        assert!(outputs.iter().all(|output| output.max_bytes == 256));
+    }
+
+    #[test]
+    fn rejects_non_uniform_declared_maxima() {
+        let (_root, output) = output_root(&["a.txt", "b.txt"]);
+        let message = rejection(
+            &output,
+            &[declared("a.txt", Some(256)), declared("b.txt", None)],
+        );
+        assert!(message.contains("uniform"), "{message}");
+    }
+
+    #[test]
+    fn rejects_hard_linked_declared_outputs() {
+        let (_root, output) = output_root(&["a.txt"]);
+        fs::hard_link(output.join("a.txt"), output.join("alias.txt")).unwrap();
+        let message = rejection(&output, &[declared("a.txt", None)]);
+        assert!(message.contains("unsafe"), "{message}");
+    }
+
+    #[test]
+    fn rejects_undeclared_files_in_the_output_tree() {
+        let (_root, output) = output_root(&["a.txt", "extra.txt"]);
+        let message = rejection(&output, &[declared("a.txt", None)]);
+        assert!(message.contains("undeclared"), "{message}");
+    }
+
+    #[test]
+    fn rejects_declared_outputs_that_do_not_start_empty() {
+        let (_root, output) = output_root(&["a.txt"]);
+        fs::write(output.join("a.txt"), b"stale").unwrap();
+        let message = rejection(&output, &[declared("a.txt", None)]);
+        assert!(message.contains("unsafe"), "{message}");
+    }
+
+    #[test]
+    fn rejects_unsafe_declared_output_paths() {
+        let (_root, output) = output_root(&[]);
+        for path in ["", "../escape", "/abs", "a\\b", "./a", "a/../b"] {
+            let message = rejection(&output, &[declared(path, None)]);
+            assert!(message.contains("path is invalid"), "{path}: {message}");
+        }
     }
 }

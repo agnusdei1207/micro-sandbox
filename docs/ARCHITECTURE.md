@@ -45,7 +45,9 @@ Resource policy is package defaults, instance defaults, profile limits, then job
 
 Node queue capacity, native scheduler capacity, and disk reservations are different controls. Scheduler reservations are local to a supervisor; multiple supervisors observe shared live cgroup usage but do not share a global reservation lock. Operators must provision and budget shared deployments accordingly.
 
-RAII guards cover ordinary setup, execution, cancellation, and error paths. Parent-death signals terminate launchers and guests if their owner dies; guest seccomp prevents clearing that setting. Forced supervisor death can leave empty cgroup directories, which the next supervisor reconciles only when the recorded owner is dead. Live owners are preserved.
+RAII guards cover ordinary setup, execution, cancellation, and error paths. Parent-death signals terminate launchers and guests if their owner dies; guest seccomp prevents clearing that setting. Launchers report failures as a structured error that the supervisor relays with its original code. Each launcher stages its private root in a randomly named directory inside a per-user `0700` temporary directory. After a launcher exits or is cancelled, the supervisor removes its cgroup and staging directory off the protocol loop before answering; a cleanup failure is logged without affecting other jobs. Forced supervisor death can leave empty cgroup and staging directories, which the next supervisor reconciles only when the recorded owner is dead. Live owners are preserved.
+
+Live admission counts each running job's reservation only once: cgroup headroom already excludes the jobs' measured memory and PID usage, so only the unused remainder of existing reservations is subtracted again, while the startup budget bounds total reservations.
 
 ## Filesystem and syscall boundary
 
@@ -53,4 +55,4 @@ Runtime sources must canonically remain inside the configured root. Only `bin`, 
 
 The private root is a writable 16 MiB tmpfs and permits execution; `/tmp` is another 16 MiB tmpfs with `noexec`. Artifact mounts use `noexec`, which prevents direct execution from those mounts but does not stop an interpreter from reading a script. Runtime compatibility and tool selection remain caller policy.
 
-Seccomp blocks mount/namespace manipulation, ptrace, BPF, keyrings, module operations, perf, userfaultfd, io_uring, and file-preallocation bypasses. A private network namespace has no host interfaces or routes. This is defense in depth, not VM-equivalent isolation or a guarantee against future kernel vulnerabilities.
+Seccomp blocks mount/namespace manipulation (including `fspick` and `open_tree_attr`), ptrace and cross-process memory or descriptor access (`process_vm_readv`/`process_vm_writev`, `pidfd_getfd`), BPF, keyrings, module and kexec operations, quota control, perf, userfaultfd, io_uring, and file-preallocation bypasses. Legacy `clone` may not request namespace flags, and `clone3` fails with `ENOSYS` so libc falls back to legacy `clone`. A private network namespace has no host interfaces or routes. This is defense in depth, not VM-equivalent isolation or a guarantee against future kernel vulnerabilities.

@@ -27,7 +27,7 @@ impl Capacity {
             && self.pids <= limit.pids
     }
 
-    fn saturating_sub(self, other: Self) -> Self {
+    pub fn saturating_sub(self, other: Self) -> Self {
         Self {
             memory_bytes: self.memory_bytes.saturating_sub(other.memory_bytes),
             cpu_millis: self.cpu_millis.saturating_sub(other.cpu_millis),
@@ -58,20 +58,33 @@ impl Scheduler {
     }
 
     pub fn reserve(&self, request: ResourceRequest) -> Result<Reservation, SandboxError> {
-        self.reserve_with_limit(request, self.limit)
+        self.reserve_with_limit(request, self.limit, Capacity::default())
     }
 
+    /// Reserves `request` against the static limit and a live headroom snapshot.
+    ///
+    /// `live_headroom` is measured from cgroup usage that already includes
+    /// `own_live_usage`, the usage of this scheduler's running jobs. Only the unused part
+    /// of existing reservations is therefore subtracted again:
+    /// `request + max(0, reserved - own_live_usage) <= live_headroom`, while
+    /// `reserved + request <= limit` bounds the total.
     pub fn reserve_with_limit(
         &self,
         request: ResourceRequest,
-        live_limit: Capacity,
+        live_headroom: Capacity,
+        own_live_usage: Capacity,
     ) -> Result<Reservation, SandboxError> {
         let mut state = lock_unpoisoned(&self.state);
         let total = state
             .reserved
             .checked_add(request)
             .ok_or(SandboxError::CapacityExceeded)?;
-        if !total.fits_within(self.limit) || !total.fits_within(live_limit) {
+        let live_demand = state
+            .reserved
+            .saturating_sub(own_live_usage)
+            .checked_add(request)
+            .ok_or(SandboxError::CapacityExceeded)?;
+        if !total.fits_within(self.limit) || !live_demand.fits_within(live_headroom) {
             return Err(SandboxError::CapacityExceeded);
         }
         state.reserved = total;

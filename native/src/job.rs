@@ -3,22 +3,29 @@ use crate::config::ResourceLimits;
 use crate::error::SandboxError;
 use crate::linux::cgroup::{Cgroup, validate_job_id};
 use crate::linux::clone::{CloneOutcome, RunningChild, clone_isolated, wait_until_ready};
-use crate::linux::{capabilities, mount, seccomp};
+use crate::linux::{self, mount, write_byte};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Interval for artifact-tree checks and memory sampling while a guest runs.
+const MONITOR_INTERVAL: Duration = Duration::from_millis(20);
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LaunchSpec {
+    /// Filesystem identifier for the job. The supervisor always replaces it with an
+    /// owned value, so callers may omit it.
+    #[serde(default)]
     pub job_id: String,
     pub rootfs: PathBuf,
     pub command: String,
@@ -86,35 +93,25 @@ pub fn launch(spec: LaunchSpec, cgroup_root: &Path) -> Result<LaunchResult, Sand
     match clone_isolated(Some(cgroup_fd.as_raw_fd()))? {
         CloneOutcome::Child(child) => {
             let pipes = pipes.into_child();
-            let outcome = child.wait_for_mapping().and_then(|()| {
-                redirect_standard_streams(&pipes)?;
+            // Never unwind out of the child: that would run copies of the parent's guards.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                child.wait_for_mapping()?;
                 mount::build_root(&rootfs, staging_root.path(), workspace.as_ref())?;
                 change_directory(&spec.cwd)?;
-                if let Some(maximum) = workspace
-                    .as_ref()
-                    .and_then(|validated| validated.outputs.first())
-                    .map(|output| output.max_bytes)
-                {
-                    set_file_size_limit(maximum)?;
-                }
-                capabilities::drop_all()?;
-                disable_dumps()?;
-                seccomp::apply_baseline()?;
-                signal_ready(pipes.ready_write.as_raw_fd())?;
+                linux::harden(workspace.as_ref().and_then(|value| value.file_size_limit))?;
+                // Redirect last so setup failures still reach the launcher's stderr.
+                redirect_standard_streams(&pipes)?;
+                write_byte(pipes.ready_write.as_raw_fd(), 1)?;
                 exec(&spec)
-            });
+            }))
+            .unwrap_or_else(|_| Err(SandboxError::Security("isolated child panicked".into())));
             child_exit(outcome)
         }
         CloneOutcome::Parent(parent) => {
             let pipes = pipes.into_parent();
-            let child = parent.map_current_user_and_release(
-                started + Duration::from_millis(spec.limits.timeout_ms),
-            )?;
-            wait_until_ready(
-                pipes.ready_read.as_raw_fd(),
-                child.pidfd(),
-                started + Duration::from_millis(spec.limits.timeout_ms),
-            )?;
+            let deadline = started + Duration::from_millis(spec.limits.timeout_ms);
+            let child = parent.map_current_user_and_release(deadline)?;
+            wait_until_ready(pipes.ready_read.as_raw_fd(), child.pidfd(), deadline)?;
             supervise_child(
                 child,
                 pipes,
@@ -139,16 +136,7 @@ fn validate_spec(
     spec.limits
         .validate_transport_bounds()
         .map_err(|message| SandboxError::PolicyViolation(message.into()))?;
-    let command = Path::new(&spec.command);
-    if !command.is_absolute()
-        || command
-            .components()
-            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
-    {
-        return Err(SandboxError::PolicyViolation(
-            "command must be a normalized absolute path".into(),
-        ));
-    }
+    validate_guest_path(&spec.command, "command")?;
     if spec.command.contains('\0') || spec.args.iter().any(|value| value.contains('\0')) {
         return Err(SandboxError::PolicyViolation(
             "command and arguments may not contain NUL".into(),
@@ -180,8 +168,7 @@ fn validate_spec(
             "runtime root must be a directory".into(),
         ));
     }
-    let host_command = rootfs.join(command.strip_prefix("/").expect("absolute path"));
-    if !host_command.is_file() {
+    if !is_runtime_file(&rootfs, &spec.command) {
         return Err(SandboxError::PolicyViolation(format!(
             "command does not exist in runtime: {}",
             spec.command
@@ -193,6 +180,42 @@ fn validate_spec(
         .map(artifact::validate_workspace)
         .transpose()?;
     Ok((rootfs, stdin, workspace))
+}
+
+/// Checks that `command` names a regular file when resolved as the guest would,
+/// with absolute symlinks interpreted relative to `rootfs` rather than the host root.
+fn is_runtime_file(rootfs: &Path, command: &str) -> bool {
+    let Ok(root) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(rootfs)
+    else {
+        return false;
+    };
+    let Ok(relative) = CString::new(command.trim_start_matches('/')) else {
+        return false;
+    };
+    // SAFETY: open_how contains only integers, for which all-zero bytes are valid.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: root is an open directory, relative is NUL-terminated, and how is a valid
+    // open_how whose size is passed explicitly.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            relative.as_ptr(),
+            &how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: a successful openat2 returns a new descriptor owned by this function.
+    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+    file.metadata().is_ok_and(|metadata| metadata.is_file())
 }
 
 fn supervise_child(
@@ -209,22 +232,31 @@ fn supervise_child(
         let mut file = File::from(pipes.stdin_write);
         file.write_all(&stdin)
     });
+    let (wake_read, wake_write) = linux::pipe()?;
+    let wake_write = Arc::new(wake_write);
     let overflow = Arc::new(AtomicBool::new(false));
     let remaining = Arc::new(AtomicU64::new(spec.limits.output_bytes));
-    let stdout_reader = read_stream(pipes.stdout_read, remaining.clone(), overflow.clone());
-    let stderr_reader = read_stream(pipes.stderr_read, remaining, overflow.clone());
+    let stdout_reader = read_stream(
+        pipes.stdout_read,
+        remaining.clone(),
+        overflow.clone(),
+        wake_write.clone(),
+    );
+    let stderr_reader = read_stream(pipes.stderr_read, remaining, overflow.clone(), wake_write);
     let deadline = started + Duration::from_millis(spec.limits.timeout_ms);
     let mut timed_out = false;
     let mut observed_peak_memory = cgroup.memory_current_bytes().unwrap_or(0);
     let mut artifact_error = None;
-    let mut next_artifact_check = Instant::now();
+    let mut next_check = Instant::now();
 
     let status = loop {
-        observed_peak_memory = observed_peak_memory.max(cgroup.memory_current_bytes().unwrap_or(0));
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if Instant::now() >= next_artifact_check {
+        let now = Instant::now();
+        if now >= next_check {
+            observed_peak_memory =
+                observed_peak_memory.max(cgroup.memory_current_bytes().unwrap_or(0));
             if let (Some(workspace), Some(workspace_spec)) = (workspace, &spec.workspace)
                 && let Err(error) = artifact::validate_outputs(workspace, workspace_spec.limits)
             {
@@ -233,15 +265,19 @@ fn supervise_child(
                 cgroup.kill_all()?;
                 break child.wait()?;
             }
-            next_artifact_check = Instant::now() + Duration::from_millis(20);
+            next_check = now + MONITOR_INTERVAL;
         }
-        if Instant::now() >= deadline || overflow.load(Ordering::Acquire) {
-            timed_out = Instant::now() >= deadline;
+        if now >= deadline || overflow.load(Ordering::Acquire) {
+            timed_out = now >= deadline;
             child.send_signal(libc::SIGKILL)?;
             cgroup.kill_all()?;
             break child.wait()?;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        wait_for_event(
+            child.pidfd(),
+            wake_read.as_raw_fd(),
+            deadline.min(next_check).saturating_duration_since(now),
+        )?;
     };
 
     cgroup.kill_all()?;
@@ -294,17 +330,22 @@ fn supervise_child(
     })
 }
 
-fn set_file_size_limit(bytes: u64) -> Result<(), SandboxError> {
-    let limit = libc::rlimit {
-        rlim_cur: bytes,
-        rlim_max: bytes,
-    };
-    // SAFETY: limit points to a valid rlimit value for the current isolated process.
-    if unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) } == -1 {
-        return Err(SandboxError::Security(format!(
-            "setrlimit RLIMIT_FSIZE: {}",
-            io::Error::last_os_error()
-        )));
+/// Sleeps until the guest exits, an output reader reports overflow, or `timeout` passes.
+fn wait_for_event(pidfd: RawFd, wake: RawFd, timeout: Duration) -> Result<(), SandboxError> {
+    let mut descriptors = [pidfd, wake].map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    // Round up so a sub-millisecond remainder does not become a busy loop.
+    let timeout = i32::try_from(timeout.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+    // SAFETY: descriptors points to two initialized pollfd values.
+    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(SandboxError::Io(error));
+        }
     }
     Ok(())
 }
@@ -313,6 +354,7 @@ fn read_stream(
     fd: OwnedFd,
     remaining: Arc<AtomicU64>,
     overflow: Arc<AtomicBool>,
+    wake: Arc<OwnedFd>,
 ) -> std::thread::JoinHandle<Result<Vec<u8>, io::Error>> {
     std::thread::spawn(move || {
         let mut file = File::from(fd);
@@ -327,8 +369,9 @@ fn read_stream(
             }
             let keep = claim_output_bytes(&remaining, read);
             output.extend_from_slice(&buffer[..keep]);
-            if keep < read {
-                overflow.store(true, Ordering::Release);
+            // Only the first overflow wakes the monitor, so the wake pipe never fills.
+            if keep < read && !overflow.swap(true, Ordering::AcqRel) {
+                let _ = write_byte(wake.as_raw_fd(), 1);
             }
         }
         Ok(output)
@@ -361,28 +404,6 @@ fn join_reader(
         .map_err(SandboxError::Io)
 }
 
-fn disable_dumps() -> Result<(), SandboxError> {
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: limit points to a valid rlimit and RLIMIT_CORE is supported on Linux.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } == -1 {
-        return Err(SandboxError::Security(format!(
-            "RLIMIT_CORE: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: PR_SET_DUMPABLE accepts a scalar zero with zero trailing arguments.
-    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == -1 {
-        return Err(SandboxError::Security(format!(
-            "PR_SET_DUMPABLE: {}",
-            io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
 fn redirect_standard_streams(pipes: &ChildPipes) -> Result<(), SandboxError> {
     for (source, target) in [
         (pipes.stdin_read.as_raw_fd(), libc::STDIN_FILENO),
@@ -393,15 +414,6 @@ fn redirect_standard_streams(pipes: &ChildPipes) -> Result<(), SandboxError> {
         if unsafe { libc::dup2(source, target) } == -1 {
             return Err(SandboxError::Io(io::Error::last_os_error()));
         }
-    }
-    Ok(())
-}
-
-fn signal_ready(fd: RawFd) -> Result<(), SandboxError> {
-    let byte = [1_u8];
-    // SAFETY: fd is the writable end of the setup pipe and byte is readable.
-    if unsafe { libc::write(fd, byte.as_ptr().cast(), 1) } != 1 {
-        return Err(SandboxError::Io(io::Error::last_os_error()));
     }
     Ok(())
 }
@@ -422,13 +434,17 @@ fn exec(spec: &LaunchSpec) -> Result<(), SandboxError> {
     argv.push(std::ptr::null());
     let mut values = BTreeMap::from([
         (
-            "PATH".to_string(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         ),
-        ("HOME".to_string(), "/tmp".to_string()),
-        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("HOME", "/tmp"),
+        ("LANG", "C.UTF-8"),
     ]);
-    values.extend(spec.env.clone());
+    values.extend(
+        spec.env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
     let environment = values
         .iter()
         .map(|(name, value)| CString::new(format!("{name}={value}")))
@@ -480,10 +496,10 @@ struct ChildPipes {
 
 impl JobPipes {
     fn create() -> Result<Self, SandboxError> {
-        let (stdin_read, stdin_write) = pipe()?;
-        let (stdout_read, stdout_write) = pipe()?;
-        let (stderr_read, stderr_write) = pipe()?;
-        let (ready_read, ready_write) = pipe()?;
+        let (stdin_read, stdin_write) = linux::pipe()?;
+        let (stdout_read, stdout_write) = linux::pipe()?;
+        let (stderr_read, stderr_write) = linux::pipe()?;
+        let (ready_read, ready_write) = linux::pipe()?;
         Ok(Self {
             stdin_read,
             stdin_write,
@@ -499,18 +515,11 @@ impl JobPipes {
     fn into_child(self) -> ChildPipes {
         let Self {
             stdin_read,
-            stdin_write,
-            stdout_read,
             stdout_write,
-            stderr_read,
             stderr_write,
-            ready_read,
             ready_write,
+            ..
         } = self;
-        drop(stdin_write);
-        drop(stdout_read);
-        drop(stderr_read);
-        drop(ready_read);
         ChildPipes {
             stdin_read,
             stdout_write,
@@ -521,19 +530,12 @@ impl JobPipes {
 
     fn into_parent(self) -> ParentPipes {
         let Self {
-            stdin_read,
             stdin_write,
             stdout_read,
-            stdout_write,
             stderr_read,
-            stderr_write,
             ready_read,
-            ready_write,
+            ..
         } = self;
-        drop(stdin_read);
-        drop(stdout_write);
-        drop(stderr_write);
-        drop(ready_write);
         ParentPipes {
             stdin_write,
             stdout_read,
@@ -543,21 +545,8 @@ impl JobPipes {
     }
 }
 
-fn pipe() -> Result<(OwnedFd, OwnedFd), SandboxError> {
-    let mut descriptors = [-1; 2];
-    // SAFETY: descriptors points to two writable integers.
-    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
-        return Err(SandboxError::Io(io::Error::last_os_error()));
-    }
-    // SAFETY: pipe2 returned two new owned descriptors.
-    Ok(unsafe {
-        (
-            OwnedFd::from_raw_fd(descriptors[0]),
-            OwnedFd::from_raw_fd(descriptors[1]),
-        )
-    })
-}
-
+/// Owns a job's empty staging directory and removes it on every launcher exit path.
+/// If the launcher is killed, the supervisor removes it instead.
 struct StagingRoot(PathBuf);
 
 impl StagingRoot {
@@ -572,7 +561,7 @@ impl StagingRoot {
 
 impl Drop for StagingRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
+        let _ = mount::remove_staging_root(&self.0);
     }
 }
 
@@ -627,4 +616,115 @@ fn change_directory(path: &str) -> Result<(), SandboxError> {
         return Err(SandboxError::Io(io::Error::last_os_error()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn spec(command: &str) -> LaunchSpec {
+        LaunchSpec {
+            job_id: String::new(),
+            rootfs: PathBuf::from("/"),
+            command: command.into(),
+            args: Vec::new(),
+            cwd: default_cwd(),
+            env: BTreeMap::new(),
+            stdin_base64: String::new(),
+            limits: ResourceLimits {
+                input_bytes: 4,
+                ..ResourceLimits::default()
+            },
+            workspace: None,
+        }
+    }
+
+    fn rejection(spec: &LaunchSpec) -> String {
+        match validate_spec(spec) {
+            Ok(_) => panic!("specification was accepted"),
+            Err(error) => {
+                assert_eq!(error.code(), "POLICY_VIOLATION", "{error}");
+                error.to_string()
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_portable_environment_names_only() {
+        for name in ["A", "_", "_private", "PATH", "a1_B2"] {
+            assert!(valid_environment_name(name), "{name}");
+        }
+        for name in ["", "1A", "A-B", "A=B", "A B", "É", "A.B"] {
+            assert!(!valid_environment_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn accepts_a_command_present_in_the_runtime() {
+        assert!(validate_spec(&spec("/bin/sh")).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_launch_specifications() {
+        let mut cases = Vec::new();
+        let mut zero_timeout = spec("/bin/sh");
+        zero_timeout.limits.timeout_ms = 0;
+        cases.push((zero_timeout, "timeout"));
+        let mut transport = spec("/bin/sh");
+        transport.limits.output_bytes = 0;
+        cases.push((transport, "output limit"));
+        for command in ["bin/sh", "/bin/../bin/sh", "./bin/sh", ""] {
+            cases.push((spec(command), "command must be"));
+        }
+        let mut nul_argument = spec("/bin/sh");
+        nul_argument.args.push("a\0b".into());
+        cases.push((nul_argument, "NUL"));
+        let mut relative_cwd = spec("/bin/sh");
+        relative_cwd.cwd = "tmp".into();
+        cases.push((relative_cwd, "working directory"));
+        let mut bad_name = spec("/bin/sh");
+        bad_name.env.insert("1BAD".into(), "x".into());
+        cases.push((bad_name, "environment"));
+        let mut nul_value = spec("/bin/sh");
+        nul_value.env.insert("GOOD".into(), "a\0b".into());
+        cases.push((nul_value, "environment"));
+        let mut too_many = spec("/bin/sh");
+        too_many.env = (0..129)
+            .map(|index| (format!("V{index}"), String::new()))
+            .collect();
+        cases.push((too_many, "environment"));
+        let mut too_large = spec("/bin/sh");
+        too_large.env.insert("BIG".into(), "x".repeat(16 * 1024));
+        cases.push((too_large, "environment"));
+        let mut bad_stdin = spec("/bin/sh");
+        bad_stdin.stdin_base64 = "not base64!".into();
+        cases.push((bad_stdin, "base64"));
+        let mut long_stdin = spec("/bin/sh");
+        long_stdin.stdin_base64 = base64::engine::general_purpose::STANDARD.encode("12345");
+        cases.push((long_stdin, "input limit"));
+        cases.push((spec("/definitely/missing/command"), "does not exist"));
+        cases.push((spec("/bin"), "does not exist"));
+        for (spec, expected) in cases {
+            let message = rejection(&spec);
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+    }
+
+    #[test]
+    fn resolves_command_symlinks_inside_the_runtime_root() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        fs::create_dir(root.path().join("bin")).unwrap();
+        fs::write(root.path().join("usr/bin/tool"), b"").unwrap();
+        symlink("/usr/bin/tool", root.path().join("bin/tool")).unwrap();
+        // Exists on the host but not inside the runtime root.
+        symlink("/bin/sh", root.path().join("bin/host-shell")).unwrap();
+        symlink("../../../../../../bin/sh", root.path().join("bin/climb")).unwrap();
+
+        assert!(is_runtime_file(root.path(), "/bin/tool"));
+        assert!(!is_runtime_file(root.path(), "/bin/host-shell"));
+        assert!(!is_runtime_file(root.path(), "/bin/climb"));
+        assert!(!is_runtime_file(root.path(), "/usr/bin"));
+    }
 }
