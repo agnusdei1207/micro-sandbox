@@ -1,10 +1,11 @@
 import path from 'node:path';
-import { SandboxError } from '../errors.js';
+import { policyError } from '../errors.js';
 
 const RESERVED_ROOTS = ['/dev', '/proc', '/sys'];
 
 export function normalizeGuestPath(candidate: string, allowRoot = false): string {
   if (
+    typeof candidate !== 'string' ||
     candidate.length === 0 ||
     candidate.includes('\0') ||
     candidate.includes('\\') ||
@@ -24,8 +25,6 @@ export function normalizeGuestPath(candidate: string, allowRoot = false): string
   return normalized;
 }
 
-function invalidPath(candidate: string): SandboxError {
-  return new SandboxError('POLICY_VIOLATION', 'Guest path is not allowed', {
-    path: candidate,
-  });
+function invalidPath(candidate: unknown): Error {
+  return policyError('Guest path is not allowed', { path: candidate });
 }

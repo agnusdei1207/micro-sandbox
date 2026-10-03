@@ -42,10 +42,10 @@ class ControlledRequester implements SupervisorRequester {
   readonly completions: Array<(result: unknown) => void> = [];
   closed = false;
 
-  request<T>(type: string, payload: unknown, signal?: AbortSignal): Promise<T> {
+  request(type: string, payload: unknown, signal?: AbortSignal): Promise<unknown> {
     this.calls.push({ type, payload, signal });
-    return new Promise<T>((resolve, reject) => {
-      this.completions.push(resolve as (result: unknown) => void);
+    return new Promise<unknown>((resolve, reject) => {
+      this.completions.push(resolve);
       signal?.addEventListener(
         'abort',
         () => reject(new SandboxError('CANCELLED', 'cancelled')),
@@ -351,12 +351,31 @@ test('Sandbox close waits for the supervisor transport to finish closing', async
   assert.equal(closed, true);
 });
 
-test('Sandbox close rejects instead of hanging when supervisor startup failed', async () => {
+test('Sandbox close resolves instead of hanging or rethrowing when supervisor startup failed', async () => {
+  // The startup error belongs to the run that triggered it; close() has nothing to release.
   const startupError = new Error('cannot start');
   const sandbox = new Sandbox({}, async () => Promise.reject(startupError));
 
   await assert.rejects(sandbox.run({ command: '/bin/true' }), startupError);
-  await assert.rejects(sandbox.close(), startupError);
+  await sandbox.close();
+});
+
+test('Sandbox retries supervisor startup after any startup failure', async () => {
+  let starts = 0;
+  const healthy = new ControlledRequester();
+  const sandbox = new Sandbox({}, async () => {
+    starts += 1;
+    if (starts === 1) throw new SandboxError('CGROUP_DELEGATION_REQUIRED', 'not delegated');
+    return healthy;
+  });
+  await assert.rejects(sandbox.run({ command: '/bin/true' }), { code: 'CGROUP_DELEGATION_REQUIRED' });
+  const recovered = sandbox.run({ command: '/bin/true' });
+  while (healthy.completions.length === 0) await new Promise((resolve) => setImmediate(resolve));
+  healthy.completions[0](wireResult('ok'));
+  assert.equal((await recovered).stdout.toString(), 'ok');
+  assert.equal(starts, 2);
+  await sandbox.close();
+  assert.equal(healthy.closed, true);
 });
 
 test('Sandbox restarts a crashed supervisor for the next request', async () => {
@@ -505,6 +524,160 @@ test('Sandbox decodes stdout at the native 512 KiB ceiling', async () => {
   } finally {
     await sandbox.close();
   }
+});
+
+test('Sandbox.run reports invalid requests as a rejected promise, never a synchronous throw', async () => {
+  const sandbox = new Sandbox({}, async () => new ControlledRequester());
+  try {
+    let pending: Promise<unknown> | undefined;
+    assert.doesNotThrow(() => { pending = sandbox.run({ command: 'rel' }); });
+    await assert.rejects(pending!, { code: 'POLICY_VIOLATION' });
+    await assert.rejects(sandbox.run({ command: 'rel' }), { code: 'POLICY_VIOLATION' });
+    await assert.rejects(sandbox.run({ command: '/bin/true', cwd: '../x' }), { code: 'POLICY_VIOLATION' });
+    await assert.rejects(sandbox.run({ runtime: 'missing' }), { code: 'POLICY_VIOLATION' });
+  } finally {
+    await sandbox.close();
+  }
+});
+
+test('Sandbox rejects unknown limit keys before they reach the native schema', async () => {
+  let starts = 0;
+  const sandbox = new Sandbox({}, async () => {
+    starts += 1;
+    return new ControlledRequester();
+  });
+  try {
+    await assert.rejects(
+      sandbox.run({ command: '/bin/true', limits: { memoryMB: 64 } as never }),
+      { code: 'POLICY_VIOLATION' },
+    );
+    await assert.rejects(
+      sandbox.run({ command: '/bin/true', artifacts: { limits: { files: 1 } as never } }),
+      { code: 'POLICY_VIOLATION' },
+    );
+    assert.throws(
+      () => sandbox.defineProfile('typo', { limits: { cpus: 1 } as never }),
+      { code: 'POLICY_VIOLATION' },
+    );
+    assert.throws(
+      () => sandbox.defineProfile('negative', { limits: { memoryMb: -1 } }),
+      { code: 'POLICY_VIOLATION' },
+    );
+    assert.equal(starts, 0);
+  } finally {
+    await sandbox.close();
+  }
+  const misconfigured = new Sandbox({ defaults: { timeout: 1 } as never }, async () => new ControlledRequester());
+  await assert.rejects(misconfigured.run({ command: '/bin/true' }), { code: 'POLICY_VIOLATION' });
+  await misconfigured.close();
+});
+
+test('Sandbox sends only native limit keys on the wire', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({}, async () => requester);
+  const pending = sandbox.run({ command: '/bin/true', artifacts: {} });
+  while (requester.calls.length === 0) await new Promise((resolve) => setImmediate(resolve));
+  const payload = requester.calls[0]!.payload as {
+    limits: object; workspace: { limits: object };
+  };
+  assert.deepEqual(Object.keys(payload.limits).sort(), [
+    'cpu', 'inputBytes', 'memoryMb', 'outputBytes', 'pids', 'timeoutMs',
+  ]);
+  assert.deepEqual(Object.keys(payload.workspace.limits).sort(), [
+    'inputBytes', 'inputFileBytes', 'inputFiles', 'outputBytes', 'outputFileBytes', 'outputFiles',
+  ]);
+  requester.completions[0]!(wireResult());
+  await pending;
+  await sandbox.close();
+});
+
+test('Sandbox rejects an invalid overload mode', () => {
+  assert.throws(
+    () => new Sandbox({ capacity: { overload: 'drop' as never } }),
+    { code: 'POLICY_VIOLATION' },
+  );
+});
+
+test('Sandbox snapshots a request when run() is called', async () => {
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({ capacity: { maxInFlight: 1, maxQueue: 1 } }, async () => requester);
+  const first = sandbox.run({ command: '/app/task' });
+  const args = ['original'];
+  const env: Record<string, string> = { MODE: 'original' };
+  const queued = sandbox.run({ command: '/app/task', args, env });
+  args[0] = 'mutated\0';
+  env.MODE = 'mutated';
+  await new Promise((resolve) => setImmediate(resolve));
+  requester.completions[0]!(wireResult());
+  await first;
+  while (requester.calls.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  const payload = requester.calls[1]!.payload as { args: string[]; env: Record<string, string> };
+  assert.deepEqual(payload.args, ['original']);
+  assert.deepEqual(payload.env, { MODE: 'original' });
+  requester.completions[1]!(wireResult());
+  await queued;
+  await sandbox.close();
+});
+
+test('Sandbox rejects overlapping artifact paths before staging anything', async () => {
+  const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'micro-sandbox-test-'));
+  const sandbox = new Sandbox({ workspaceRoot }, async () => new ControlledRequester());
+  try {
+    for (const artifacts of [
+      { inputs: [{ target: 'a', data: 'x' }, { target: 'a/b', data: 'y' }] },
+      { inputs: [{ target: 'a/b', data: 'x' }, { target: 'a', data: 'y' }] },
+      { outputs: [{ path: 'out' }, { path: 'out/nested' }] },
+    ]) {
+      await assert.rejects(
+        sandbox.run({ command: '/bin/true', artifacts }),
+        { code: 'POLICY_VIOLATION' },
+      );
+    }
+    assert.deepEqual(await readdir(workspaceRoot), []);
+  } finally {
+    await sandbox.close();
+  }
+});
+
+test('Sandbox reports a cancelled request as CANCELLED while supervisor startup is pending', async () => {
+  let finishStartup!: (requester: SupervisorRequester) => void;
+  const requester = new ControlledRequester();
+  const sandbox = new Sandbox({}, () => new Promise((resolve) => { finishStartup = resolve; }));
+  const controller = new AbortController();
+  const pending = sandbox.run({ command: '/bin/true', signal: controller.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(pending, { code: 'CANCELLED' });
+  assert.equal(requester.calls.length, 0);
+  finishStartup(requester);
+  await sandbox.close();
+  assert.equal(requester.closed, true, 'a startup that completes after cancellation is still closed');
+});
+
+test('Sandbox reports CANCELLED and replaces a supervisor retired after an unacknowledged cancel', async () => {
+  let starts = 0;
+  const retired = {
+    closed: false,
+    request: (_type: string, _payload: unknown, signal?: AbortSignal) => new Promise<unknown>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => setTimeout(() => {
+        reject(new SandboxError('SUPERVISOR_UNAVAILABLE', 'retired after cancel grace'));
+      }, 5), { once: true });
+    }),
+    close: async () => { retired.closed = true; },
+  };
+  const sandbox = new Sandbox({}, async () => {
+    starts += 1;
+    return starts === 1 ? retired : { request: async () => wireResult('fresh'), close: async () => {} };
+  });
+  const controller = new AbortController();
+  const pending = sandbox.run({ command: '/bin/true', signal: controller.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(pending, { code: 'CANCELLED' });
+  assert.equal(retired.closed, true);
+  assert.equal((await sandbox.run({ command: '/bin/true' })).stdout.toString(), 'fresh');
+  assert.equal(starts, 2);
+  await sandbox.close();
 });
 
 test('a delayed old supervisor failure cannot discard a healthy replacement', async () => {

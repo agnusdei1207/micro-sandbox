@@ -44,15 +44,33 @@ test('FrameDecoder rejects malformed JSON and oversized unterminated input', () 
   assert.throws(
     () => malformed.push(Buffer.from('{bad}\n')),
     (error: unknown) =>
-      error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
+      error instanceof SandboxError && error.code === 'PROTOCOL_ERROR',
   );
 
   const oversized = new FrameDecoder();
   assert.throws(
     () => oversized.push(Buffer.alloc(MAX_CONTROL_FRAME_BYTES + 1, 0x78)),
     (error: unknown) =>
-      error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
+      error instanceof SandboxError && error.code === 'PROTOCOL_ERROR',
   );
+});
+
+test('FrameDecoder accumulates a frame split across many chunks', () => {
+  const decoder = new FrameDecoder();
+  const frame = encodeFrame({ version: 1, id: 3, ok: true, result: 'x'.repeat(4096) });
+  const messages: unknown[] = [];
+  for (let offset = 0; offset < frame.length; offset += 7) {
+    messages.push(...decoder.push(frame.subarray(offset, offset + 7)));
+  }
+  assert.deepEqual(messages, [{ version: 1, id: 3, ok: true, result: 'x'.repeat(4096) }]);
+});
+
+test('FrameDecoder rejects an oversized frame assembled from small chunks', () => {
+  const decoder = new FrameDecoder();
+  const chunk = Buffer.alloc(64 * 1024, 0x78);
+  assert.throws(() => {
+    for (let total = 0; total <= MAX_CONTROL_FRAME_BYTES; total += chunk.length) decoder.push(chunk);
+  }, { code: 'PROTOCOL_ERROR' });
 });
 
 test('FrameDecoder rejects an oversized trailing fragment after a complete frame', () => {
@@ -62,6 +80,6 @@ test('FrameDecoder rejects an oversized trailing fragment after a complete frame
       encodeFrame({ ok: true }),
       Buffer.alloc(MAX_CONTROL_FRAME_BYTES + 1, 0x78),
     ])),
-    (error: unknown) => error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE',
+    (error: unknown) => error instanceof SandboxError && error.code === 'PROTOCOL_ERROR',
   );
 });

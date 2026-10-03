@@ -5,7 +5,7 @@ import { resolveSupervisorBinary } from '../dist/platform/binary.js';
 import { SupervisorClient } from '../dist/supervisor/client.js';
 import type {
   SupervisorInboundMessage,
-  SupervisorOutboundMessage,
+  SupervisorRequestMessage,
   SupervisorTransport,
 } from '../dist/supervisor/transport.js';
 import { validateInboundMessage } from '../dist/supervisor/transport.js';
@@ -22,11 +22,11 @@ test('transport validates native response schemas and stable error codes', () =>
 });
 
 class FakeTransport implements SupervisorTransport {
-  readonly sent: SupervisorOutboundMessage[] = [];
+  readonly sent: SupervisorRequestMessage[] = [];
   private messageListeners = new Set<(message: SupervisorInboundMessage) => void>();
   private closeListeners = new Set<(error?: Error) => void>();
 
-  send(message: SupervisorOutboundMessage): void {
+  send(message: SupervisorRequestMessage): void {
     this.sent.push(message);
   }
 
@@ -56,8 +56,8 @@ class FakeTransport implements SupervisorTransport {
 test('SupervisorClient correlates concurrent out-of-order responses', async () => {
   const transport = new FakeTransport();
   const client = new SupervisorClient(transport);
-  const first = client.request<{ value: number }>('health', {});
-  const second = client.request<{ value: number }>('health', {});
+  const first = client.request('health', {});
+  const second = client.request('health', {});
 
   const [firstMessage, secondMessage] = transport.sent;
   transport.respond({ version: 1, id: secondMessage.id, ok: true, result: { value: 2 } });
@@ -109,9 +109,11 @@ test('SupervisorClient sends cancellation and rejects an aborted request', async
   const runMessage = transport.sent[0];
 
   controller.abort();
-  assert.deepEqual(transport.sent[1], {
+  const cancel = transport.sent[1];
+  assert.notEqual(cancel.id, runMessage.id, 'cancel must not reuse the run request id');
+  assert.deepEqual(cancel, {
     version: 1,
-    id: runMessage.id,
+    id: cancel.id,
     type: 'cancel',
     payload: { requestId: runMessage.id },
   });
@@ -182,4 +184,44 @@ test('SupervisorClient retains cancelled jobs until cleanup when cancellation ca
   assert.equal(settled, false, 'workspace ownership must remain until cleanup completes');
   release();
   await checked;
+});
+
+test('SupervisorClient retires the transport when a cancelled request is never acknowledged', async () => {
+  const transport = new FakeTransport();
+  let closes = 0;
+  transport.close = async () => {
+    closes += 1;
+    transport.fail();
+  };
+  const client = new SupervisorClient(transport, { cancelGraceMs: 20 });
+  const controller = new AbortController();
+  const pending = client.request('run', {}, controller.signal);
+  controller.abort();
+  assert.equal(transport.sent[1]?.type, 'cancel');
+  await assert.rejects(pending, { code: 'SUPERVISOR_UNAVAILABLE' });
+  assert.equal(closes, 1);
+});
+
+test('SupervisorClient keeps the transport when cancellation is acknowledged in time', async () => {
+  const transport = new FakeTransport();
+  let closes = 0;
+  transport.close = async () => { closes += 1; };
+  const client = new SupervisorClient(transport, { cancelGraceMs: 20 });
+  const controller = new AbortController();
+  const pending = client.request('run', {}, controller.signal);
+  const runId = transport.sent[0]!.id;
+  controller.abort();
+  transport.respond({
+    version: 1, id: runId, ok: false, error: { code: 'CANCELLED', message: 'cancelled' },
+  });
+  await assert.rejects(pending, { code: 'CANCELLED' });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(closes, 0);
+});
+
+test('transport validation rejects uncorrelated event frames', () => {
+  assert.throws(
+    () => validateInboundMessage({ version: 1, event: 'heartbeat', timestampMs: 1 }),
+    { code: 'PROTOCOL_ERROR' },
+  );
 });

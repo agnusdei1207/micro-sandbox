@@ -18,13 +18,17 @@ Register runtimes and profiles before the supervisor starts. Both convenience me
 
 The Node queue defaults to 32 active jobs and 100 waiting jobs. `maxInFlight` is limited to 64, `maxQueue` to 10,000. `overload: 'reject'` rejects when all active slots are occupied; `'wait'` queues until the queue bound is reached. Native live resource admission may still reject an admitted Node request.
 
-`close()` stops accepting requests, drains queued and active work, waits for supervisor shutdown, and removes an instance-owned workspace root. Repeated calls share completion. Abort a job with its `AbortSignal`; a running request retains its slot until cancellation is acknowledged or supervisor cleanup finishes. A failed supervisor is retired before the affected request settles; later requests may create a replacement.
+`run()` validates and snapshots the request when it is called (command, runtime, profile, limits, arguments, environment, stdin, and artifact declarations) and reports every failure, including an invalid request, as a rejected promise. Unknown keys in resource or artifact limits, profiles, defaults, or ceilings are rejected with `POLICY_VIOLATION`. Profiles are shape-checked by `defineProfile()`; operator ceilings still apply per run.
+
+`close()` stops accepting requests, drains queued and active work, waits for supervisor shutdown, and removes an instance-owned workspace root. Repeated calls share completion. Shutdown closes the supervisor's stdin so it can cancel, reap, and clean up its jobs, then escalates to `SIGTERM` and `SIGKILL` if it does not exit. A supervisor that failed to start owns nothing: its error is reported to the triggering request, `close()` does not rethrow it, and the next request starts a fresh supervisor.
+
+Abort a job with its `AbortSignal`. An abort while the supervisor is starting settles the request immediately with `CANCELLED`. A running request retains its slot until cancellation is acknowledged or supervisor cleanup finishes; if the supervisor does not acknowledge within a bounded grace period it is retired, and the request settles with `CANCELLED` once the retired supervisor has closed. Supervisor startup has a bounded health check. A failed supervisor is retired before the affected request settles; later requests may create a replacement.
 
 `timeoutMs` applies to native job execution and setup. Time spent in the Node queue or staging an input stream is outside that deadline. Use an `AbortSignal` for an end-to-end deadline, and ensure custom iterable producers stop when their supplied signal aborts. Treat request objects, buffers, and configuration as immutable while in use.
 
 ## Artifact contract
 
-Inputs accept bytes, a regular single-link source file, a destroyable stream, or a cancellation-aware iterable factory. Paths are normalized relative POSIX file paths. The guest reads `/input` and writes predeclared files under `/output`; it cannot create additional output files or replace output directories.
+Inputs accept bytes, a regular single-link source file, a destroyable stream, or a cancellation-aware iterable factory; exactly one source must be defined, and streamed chunks must be strings or `Uint8Array`s. Paths are normalized relative POSIX file paths, and no path may also be another path's parent directory (for example `a` and `a/b`). A missing or unreadable source file or output is a `POLICY_VIOLATION` with the original error as `cause`; failures of the host workspace itself are `INTERNAL_ERROR`. The guest reads `/input` and writes predeclared files under `/output`; it cannot create additional output files or replace output directories.
 
 All declared outputs must resolve to the same `maxBytes`. Each defaults to `limits.outputFileBytes`; explicit uniform per-output maxima may be smaller. The sum of the resolved maxima must fit `limits.outputBytes`. The launcher applies that uniform maximum through `RLIMIT_FSIZE` and blocks preallocation bypasses.
 
@@ -87,6 +91,6 @@ After publication, refresh optional-dependency metadata with `npm install --pack
 | `ISOLATION_UNAVAILABLE` or `CGROUP_ERROR` | Kernel support, namespace restrictions, controller delegation, and supervisor error details. |
 | `CAPACITY_EXCEEDED` | Node queue saturation, live ancestor resource headroom, and workspace free space. |
 | `POLICY_VIOLATION` | Paths, registration, byte/file limits, artifact declarations, and supplied overrides. |
-| `PROTOCOL_ERROR` or `SUPERVISOR_UNAVAILABLE` | Trusted binary version, process exit details, and transport failure. |
+| `PROTOCOL_ERROR` or `SUPERVISOR_UNAVAILABLE` | Trusted binary version, process exit details, and transport failure. Malformed supervisor output is a `PROTOCOL_ERROR` that retires the supervisor, so the affected requests see `SUPERVISOR_UNAVAILABLE` with it as `cause`. A control frame that a request makes larger than 1 MiB is a `POLICY_VIOLATION`. |
 
 Do not interpret an empty result or exit code alone as semantic validation. The sandbox contains execution; the caller owns transformation correctness.

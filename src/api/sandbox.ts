@@ -1,17 +1,28 @@
 import { randomUUID } from 'node:crypto';
 import {
   defaultWorkspaceRoot,
+  planArtifacts,
   prepareWorkspace,
   removeWorkspace,
   reserveWorkspaceCapacity,
+  type ArtifactPlan,
+  type PreparedWorkspace,
 } from '../artifacts/workspace.js';
-import { SandboxError } from '../errors.js';
+import {
+  cancelledError,
+  isSandboxError,
+  policyError,
+  raceAbort,
+  SandboxError,
+  throwIfAborted,
+  toError,
+} from '../errors.js';
 import { resolveSupervisorBinary } from '../platform/binary.js';
 import { resolveSupervisorEnvironment } from '../platform/environment.js';
 import { resolveArtifactLimits } from '../policy/artifacts.js';
 import { normalizeGuestPath } from '../policy/paths.js';
 import { resolvePolicy } from '../policy/resolve.js';
-import { SupervisorClient } from '../supervisor/client.js';
+import { connectSupervisor } from '../supervisor/client.js';
 import { ChildProcessTransport } from '../supervisor/transport.js';
 import type {
   CapacityOptions,
@@ -19,18 +30,39 @@ import type {
   JobResult,
   ProfileDefinition,
   ResolvedProfile,
+  ResourceLimits,
   RuntimeDefinition,
   SandboxOptions,
   SupervisorRequester,
 } from '../types.js';
 import { ProfileRegistry } from './profile-registry.js';
 import { RuntimeRegistry } from './runtime-registry.js';
-import { decodeJobResult, type WireJobResult } from './job-result.js';
+import { decodeJobResult } from './job-result.js';
 
 type RequesterFactory = () => Promise<SupervisorRequester>;
 
+/** Mirror of the native `LaunchSpec` (native/src/job.rs, `deny_unknown_fields`). */
+interface WireLaunchSpec {
+  readonly jobId: string;
+  readonly rootfs: string;
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: Readonly<Record<string, string>>;
+  readonly stdinBase64: string;
+  readonly limits: Readonly<ResourceLimits>;
+  readonly workspace?: PreparedWorkspace;
+}
+
+/** A request validated and snapshotted when run() is called. */
+interface PreparedJob {
+  readonly spec: Omit<WireLaunchSpec, 'jobId' | 'workspace'>;
+  readonly artifacts: ArtifactPlan | undefined;
+  readonly signal: AbortSignal | undefined;
+}
+
 interface QueueEntry {
-  readonly request: JobRequest;
+  readonly job: PreparedJob;
   readonly resolve: (result: JobResult) => void;
   readonly reject: (error: Error) => void;
   removeAbort?: () => void;
@@ -59,8 +91,15 @@ export class Sandbox implements AsyncDisposable {
   private readonly ownsWorkspaceRoot: boolean;
   private workspaceReservedBytes = 0n;
 
+  /**
+   * @param options Instance configuration.
+   * @param requesterFactory Internal test hook that replaces the native supervisor.
+   * It is not part of the supported API; construct with `new Sandbox(options)` or
+   * `createSandbox(options)`.
+   */
   constructor(
     options: SandboxOptions = {},
+    /** @deprecated Internal test hook; not supported for application use. */
     requesterFactory?: RequesterFactory,
   ) {
     this.ownsWorkspaceRoot = options.workspaceRoot === undefined;
@@ -73,46 +112,46 @@ export class Sandbox implements AsyncDisposable {
       this.capacity.maxInFlight <= 0 ||
       this.capacity.maxInFlight > 64 ||
       !Number.isInteger(this.capacity.maxQueue) ||
-      this.capacity.maxQueue < 0
-      || this.capacity.maxQueue > 10_000
+      this.capacity.maxQueue < 0 ||
+      this.capacity.maxQueue > 10_000 ||
+      (this.capacity.overload !== 'wait' && this.capacity.overload !== 'reject')
     ) {
-      throw new SandboxError('POLICY_VIOLATION', 'Capacity values are invalid');
+      throw policyError('Capacity values are invalid');
     }
   }
 
-  run(request: JobRequest): Promise<JobResult> {
+  /**
+   * Validates and snapshots `request`, then queues it. Every failure, including an
+   * invalid request, is reported through the returned promise.
+   */
+  async run(request: JobRequest): Promise<JobResult> {
     if (this.closing) {
-      return Promise.reject(
-        new SandboxError('SUPERVISOR_UNAVAILABLE', 'Sandbox is closing'),
-      );
+      throw new SandboxError('SUPERVISOR_UNAVAILABLE', 'Sandbox is closing');
     }
-    validateRequest(request);
-    if (request.signal?.aborted) {
-      return Promise.reject(new SandboxError('CANCELLED', 'Sandbox request was cancelled'));
-    }
+    const job = this.prepareJob(request);
+    throwIfAborted(job.signal);
     if (
       this.active >= this.capacity.maxInFlight &&
       (this.capacity.overload === 'reject' || this.queue.length >= this.capacity.maxQueue)
     ) {
-      return Promise.reject(
-        new SandboxError('CAPACITY_EXCEEDED', 'Sandbox queue is full', {
-          maxQueue: this.capacity.maxQueue,
-        }),
-      );
+      throw new SandboxError('CAPACITY_EXCEEDED', 'Sandbox queue is full', {
+        maxQueue: this.capacity.maxQueue,
+      });
     }
 
     return new Promise<JobResult>((resolve, reject) => {
-      const entry: QueueEntry = { request, resolve, reject };
-      if (request.signal) {
+      const entry: QueueEntry = { job, resolve, reject };
+      const { signal } = job;
+      if (signal) {
         const onAbort = () => {
           const index = this.queue.indexOf(entry);
           if (index === -1) return;
           this.queue.splice(index, 1);
-          reject(new SandboxError('CANCELLED', 'Sandbox request was cancelled'));
+          reject(cancelledError());
           this.finishCloseIfIdle();
         };
-        request.signal.addEventListener('abort', onAbort, { once: true });
-        entry.removeAbort = () => request.signal?.removeEventListener('abort', onAbort);
+        signal.addEventListener('abort', onAbort, { once: true });
+        entry.removeAbort = () => signal.removeEventListener('abort', onAbort);
       }
       this.queue.push(entry);
       this.pump();
@@ -153,112 +192,167 @@ export class Sandbox implements AsyncDisposable {
   }
 
   private async execute(entry: QueueEntry): Promise<void> {
-    let workspace: Awaited<ReturnType<typeof prepareWorkspace>> | undefined;
-    let workspaceReservation = 0n;
-    let completed: JobResult | undefined;
-    let failure: unknown;
-    let requesterPromise: Promise<SupervisorRequester> | undefined;
+    let outcome: { readonly result: JobResult } | { readonly error: unknown };
     try {
-      const payload = this.resolveRunPayload(entry.request);
-      if (entry.request.artifacts) {
-        const limits = resolveArtifactLimits(
-          this.options.artifactDefaults ?? {},
-          this.options.artifactCeilings ?? {},
-          entry.request.artifacts.limits ?? {},
-        );
-        const capacity = await reserveWorkspaceCapacity(
-          this.workspaceRoot,
-          limits,
-        );
-        if (this.workspaceReservedBytes + capacity.requested > capacity.usable) {
-          throw new SandboxError(
-            'CAPACITY_EXCEEDED',
-            'Concurrent artifact jobs exceed the workspace free-space reserve',
-          );
-        }
-        workspaceReservation = capacity.requested;
-        this.workspaceReservedBytes += workspaceReservation;
-        workspace = await prepareWorkspace(
-          this.workspaceRoot,
-          entry.request.artifacts,
-          limits,
-          entry.request.signal,
-        );
-      }
-      requesterPromise = this.getRequester();
-      const requester = await requesterPromise;
-      const result = await requester.request<WireJobResult>(
-        'run',
-        {
-          jobId: `job-${randomUUID().replaceAll('-', '')}`,
-          ...payload,
-          ...(workspace ? { workspace } : {}),
-        },
-        entry.request.signal,
-      );
-      completed = await decodeJobResult(result, workspace, entry.request.signal);
+      outcome = {
+        result: await this.withWorkspace(
+          entry.job,
+          (workspace) => this.dispatch(entry.job, workspace),
+        ),
+      };
     } catch (error) {
-      failure = error;
-      if (error instanceof SandboxError && error.code === 'SUPERVISOR_UNAVAILABLE') {
-        // A delayed failure from an old supervisor must not discard its replacement.
-        if (this.requesterPromise === requesterPromise) this.requesterPromise = undefined;
-        const requester = await requesterPromise?.catch(() => undefined);
-        if (requester) {
-          try {
-            await requester.close();
-          } catch (cleanupError) {
-            failure = new AggregateError([error, cleanupError], 'Supervisor failure and cleanup failed');
-          }
-        }
-      }
+      outcome = { error };
     } finally {
-      try {
-        if (workspace) await removeWorkspace(workspace.path);
-      } catch (error) {
-        failure ??= error;
-      } finally {
-        this.workspaceReservedBytes -= workspaceReservation;
-        this.active -= 1;
-        this.pump();
-        this.finishCloseIfIdle();
-      }
+      this.active -= 1;
+      this.pump();
+      this.finishCloseIfIdle();
     }
-    if (failure !== undefined) {
-      entry.reject(failure instanceof Error ? failure : new Error(String(failure)));
-    } else if (completed) {
-      entry.resolve(completed);
-    } else {
-      entry.reject(new SandboxError('INTERNAL_ERROR', 'Sandbox job completed without a result'));
+    if ('result' in outcome) entry.resolve(outcome.result);
+    else entry.reject(toError(outcome.error));
+  }
+
+  /**
+   * Reserves free space, stages inputs, runs `operation`, and always removes the
+   * workspace afterwards. The operation's own failure takes precedence over a cleanup
+   * failure.
+   */
+  private async withWorkspace<T>(
+    job: PreparedJob,
+    operation: (workspace?: PreparedWorkspace) => Promise<T>,
+  ): Promise<T> {
+    if (!job.artifacts) return operation();
+    const capacity = await reserveWorkspaceCapacity(this.workspaceRoot, job.artifacts.limits);
+    if (this.workspaceReservedBytes + capacity.requested > capacity.usable) {
+      throw new SandboxError(
+        'CAPACITY_EXCEEDED',
+        'Concurrent artifact jobs exceed the workspace free-space reserve',
+      );
+    }
+    this.workspaceReservedBytes += capacity.requested;
+    try {
+      const workspace = await prepareWorkspace(this.workspaceRoot, job.artifacts, job.signal);
+      let result: T;
+      try {
+        result = await operation(workspace);
+      } catch (error) {
+        await removeWorkspace(workspace.path).catch(() => undefined);
+        throw error;
+      }
+      await removeWorkspace(workspace.path);
+      return result;
+    } finally {
+      this.workspaceReservedBytes -= capacity.requested;
     }
   }
 
-  private resolveRunPayload(request: JobRequest) {
-    const profileLimits = request.profile ? this.profiles.get(request.profile).limits : {};
-    const policy = resolvePolicy(this.options, { ...profileLimits, ...request.limits });
+  private async dispatch(job: PreparedJob, workspace?: PreparedWorkspace): Promise<JobResult> {
+    const requesterPromise = this.getRequester();
+    // Startup is shared; an aborted caller stops waiting without cancelling it.
+    const requester = await raceAbort(requesterPromise, job.signal);
+    const spec: WireLaunchSpec = {
+      jobId: `job-${randomUUID().replaceAll('-', '')}`,
+      ...job.spec,
+      ...(workspace ? { workspace } : {}),
+    };
+    let wire: unknown;
+    try {
+      wire = await requester.request('run', spec, job.signal);
+    } catch (error) {
+      throw await this.recoverRequester(error, requesterPromise, job.signal);
+    }
+    return decodeJobResult(wire, workspace, job.signal);
+  }
+
+  /**
+   * Retires a supervisor that failed underneath a request and waits for it to close,
+   * so the request's workspace is no longer in use. Returns the error to report.
+   */
+  private async recoverRequester(
+    error: unknown,
+    requesterPromise: Promise<SupervisorRequester>,
+    signal: AbortSignal | undefined,
+  ): Promise<unknown> {
+    if (!isSandboxError(error, 'SUPERVISOR_UNAVAILABLE')) return error;
+    // A delayed failure from an old supervisor must not discard its replacement.
+    if (this.requesterPromise === requesterPromise) this.requesterPromise = undefined;
+    try {
+      await (await requesterPromise).close();
+    } catch (cleanupError) {
+      return new AggregateError([error, cleanupError], 'Supervisor failure and cleanup failed');
+    }
+    // A caller who aborted sees CANCELLED even when the supervisor had to be retired
+    // because it did not acknowledge the cancellation in time.
+    return signal?.aborted ? cancelledError(error) : error;
+  }
+
+  private prepareJob(request: JobRequest): PreparedJob {
+    if (!request || typeof request !== 'object') throw policyError('Job request must be an object');
     const runtime = request.runtime ? this.runtimes.get(request.runtime) : undefined;
     const command = request.command ?? runtime?.entrypoint;
     if (!command) {
-      throw new SandboxError('POLICY_VIOLATION', 'A command or a runtime with an entrypoint is required');
+      throw policyError('A command or a runtime with an entrypoint is required');
     }
-    const stdin = request.stdin ?? '';
+    const profileLimits = request.profile ? this.profiles.get(request.profile).limits : {};
+    const policy = resolvePolicy(this.options, { ...profileLimits, ...request.limits });
+    const args: unknown = request.args ?? [];
+    if (!Array.isArray(args) || args.some((argument) => typeof argument !== 'string')) {
+      throw policyError('Command arguments must be an array of strings');
+    }
+    if ((args as string[]).some((argument) => argument.includes('\0'))) {
+      throw policyError('Command arguments may not contain NUL');
+    }
+    const env: unknown = request.env ?? {};
+    if (
+      env === null || typeof env !== 'object'
+      || Object.values(env).some((value) => typeof value !== 'string')
+    ) {
+      throw policyError('Environment must map names to string values');
+    }
+    const stdin: unknown = request.stdin ?? '';
+    if (typeof stdin !== 'string' && !(stdin instanceof Uint8Array)) {
+      throw policyError('Stdin must be a string or Uint8Array');
+    }
     if (Buffer.byteLength(stdin) > policy.limits.inputBytes) {
-      throw new SandboxError('POLICY_VIOLATION', 'Stdin exceeds its byte limit');
+      throw policyError('Stdin exceeds its byte limit');
     }
-    return {
+    const spec = Object.freeze({
       rootfs: runtime?.rootfs ?? this.options.rootfs ?? '/',
       command: normalizeGuestPath(command),
-      args: [...(request.args ?? [])],
+      args: Object.freeze([...(args as string[])]),
       cwd: normalizeGuestPath(request.cwd ?? '/', true),
-      env: { ...request.env },
+      env: Object.freeze({ ...(env as Record<string, string>) }),
       stdinBase64: Buffer.from(stdin).toString('base64'),
       limits: policy.limits,
-    };
+    });
+    const artifacts = request.artifacts === undefined
+      ? undefined
+      : planArtifacts(
+          request.artifacts,
+          resolveArtifactLimits(
+            this.options.artifactDefaults ?? {},
+            this.options.artifactCeilings ?? {},
+            request.artifacts?.limits ?? {},
+          ),
+        );
+    return Object.freeze({ spec, artifacts, signal: request.signal });
   }
 
   private getRequester(): Promise<SupervisorRequester> {
     this.runtimes.lock();
     this.profiles.lock();
-    this.requesterPromise ??= this.requesterFactory();
+    if (!this.requesterPromise) {
+      let startup: Promise<SupervisorRequester>;
+      try {
+        startup = this.requesterFactory();
+      } catch (error) {
+        startup = Promise.reject(toError(error));
+      }
+      this.requesterPromise = startup;
+      // A failed startup is never cached: the next request starts a fresh supervisor.
+      startup.catch(() => {
+        if (this.requesterPromise === startup) this.requesterPromise = undefined;
+      });
+    }
     return this.requesterPromise;
   }
 
@@ -277,7 +371,9 @@ export class Sandbox implements AsyncDisposable {
     void (async () => {
       try {
         try {
-          if (this.requesterPromise) await (await this.requesterPromise).close();
+          // A failed startup owns nothing; its error was already reported to the run.
+          const requester = await this.requesterPromise?.catch(() => undefined);
+          await requester?.close();
         } finally {
           if (this.ownsWorkspaceRoot) await removeWorkspace(this.workspaceRoot);
         }
@@ -297,29 +393,8 @@ function defaultRequesterFactory(options: SandboxOptions): RequesterFactory {
   return async () => {
     const override = options.supervisorBinary ?? process.env.MICRO_SANDBOX_BINARY;
     const binary = resolveSupervisorBinary(override ? { override } : {});
-    const client = new SupervisorClient(
+    return connectSupervisor(
       new ChildProcessTransport(binary, resolveSupervisorEnvironment(options)),
     );
-    try {
-      await client.request('health', {});
-      return client;
-    } catch (error) {
-      await client.close();
-      throw error;
-    }
   };
-}
-
-function validateRequest(request: JobRequest): void {
-  if (!request.command && !request.runtime) {
-    throw new SandboxError(
-      'POLICY_VIOLATION',
-      'A command or registered runtime is required',
-    );
-  }
-  if (request.command) normalizeGuestPath(request.command);
-  if (request.cwd) normalizeGuestPath(request.cwd, true);
-  if (request.args?.some((argument) => argument.includes('\0'))) {
-    throw new SandboxError('POLICY_VIOLATION', 'Command arguments may not contain NUL');
-  }
 }

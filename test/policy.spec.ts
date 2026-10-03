@@ -67,6 +67,20 @@ test('resolvePolicy rejects invalid numeric limits', () => {
   }
 });
 
+test('resolvePolicy rejects unknown limit keys and returns only native keys', () => {
+  for (const [options, limits] of [
+    [{ defaults: { memoryMB: 1 } }, {}],
+    [{ ceilings: { gpu: 1 } }, {}],
+    [{}, { timeout: 1 }],
+  ] as const) {
+    assert.throws(
+      () => resolvePolicy(options as never, limits as never),
+      (error: unknown) => error instanceof SandboxError && error.code === 'POLICY_VIOLATION',
+    );
+  }
+  assert.deepEqual(Object.keys(resolvePolicy().limits).sort(), Object.keys(DEFAULT_LIMITS).sort());
+});
+
 test('normalizeGuestPath accepts a normalized absolute workspace path', () => {
   assert.equal(normalizeGuestPath('/workspace/input/file.txt'), '/workspace/input/file.txt');
 });
