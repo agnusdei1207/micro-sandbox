@@ -70,6 +70,7 @@ Register caller-owned runtime roots and profiles for reusable commands and resou
 - [Operations and verification](./docs/OPERATIONS.md): deployment, lifecycle, limits, and checks.
 - [Glossary](./docs/GLOSSARY.md): shared terms.
 - [Audit and refactoring record](./docs/intents/0001-audit-and-refactor.md): findings, changes, and verification evidence.
+- [Hardening and release integrity record](./docs/intents/0002-hardening-and-release-integrity.md): 0.0.7 corrections and verification.
 - [Examples](./examples): caller-owned command recipes.
 
 MIT

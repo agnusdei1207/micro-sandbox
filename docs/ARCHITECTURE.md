@@ -17,7 +17,7 @@ Purpose and constraints belong to the [project intent](intents/00-project.md). D
 | Rust job and Linux modules | Validate launch specification, establish isolation, enforce execution limits, collect bounded streams, kill/reap, and clean cgroups | Single-threaded launcher per job |
 | Rust artifacts | Validate workspace containment, pin declared output files, inspect output tree, and hash output contents | Workspace specification to manifest |
 
-The current maintenance intent is [0001](intents/0001-audit-and-refactor.md). Policy stays independent of filesystem I/O; the workspace does not select tools or parse caller content. The supervisor launches a fresh process before namespace creation to avoid post-fork work in its multithreaded address space.
+The current maintenance intent is [0002](intents/0002-hardening-and-release-integrity.md), following [0001](intents/0001-audit-and-refactor.md). Policy stays independent of filesystem I/O; the workspace does not select tools or parse caller content. The supervisor launches a fresh process before namespace creation to avoid post-fork work in its multithreaded address space.
 
 ## Job and artifact flow
 
