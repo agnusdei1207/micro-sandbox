@@ -1,7 +1,7 @@
 use crate::error::SandboxError;
 use crate::scheduler::Capacity;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const ADMISSION_PERCENT: u64 = 80;
 
@@ -88,7 +88,39 @@ pub fn detect_admission_capacity(cgroup_root: &Path) -> Result<Capacity, Sandbox
             cgroup_root.display()
         )));
     }
-    Ok(effective_admission_capacity(&snapshots, host_fallbacks()?))
+    // Scanning /proc for host tasks is costly, so only do it when a PID limit is unbounded.
+    let count_tasks = snapshots
+        .iter()
+        .any(|snapshot| snapshot.pids_limit.is_none());
+    Ok(effective_admission_capacity(
+        &snapshots,
+        host_fallbacks(count_tasks)?,
+    ))
+}
+
+/// Sums the live memory and PID usage of this supervisor's job cgroups.
+///
+/// CPU capacity comes from quotas rather than usage, so its usage is reported as zero.
+/// Missing cgroups (not yet created or already removed) contribute nothing.
+pub fn jobs_usage<'a>(cgroup_root: &Path, job_ids: impl IntoIterator<Item = &'a str>) -> Capacity {
+    let read = |path: PathBuf| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|value| parse_number(&value).ok())
+            .unwrap_or(0)
+    };
+    job_ids
+        .into_iter()
+        .fold(Capacity::default(), |total, job_id| {
+            let path = cgroup_root.join(job_id);
+            Capacity {
+                memory_bytes: total
+                    .memory_bytes
+                    .saturating_add(read(path.join("memory.current"))),
+                cpu_millis: 0,
+                pids: total.pids.saturating_add(read(path.join("pids.current"))),
+            }
+        })
 }
 
 fn read_snapshot(cgroup: &Path) -> Result<ResourceSnapshot, SandboxError> {
@@ -101,7 +133,9 @@ fn read_snapshot(cgroup: &Path) -> Result<ResourceSnapshot, SandboxError> {
     })
 }
 
-fn host_fallbacks() -> Result<ResourceFallbacks, SandboxError> {
+/// Reads host-wide fallbacks. Without `count_tasks`, the PID fallback is unbounded
+/// because every ancestor cgroup already bounds PIDs.
+fn host_fallbacks(count_tasks: bool) -> Result<ResourceFallbacks, SandboxError> {
     let memory_bytes = fs::read_to_string("/proc/meminfo")?
         .lines()
         .find_map(|line| line.strip_prefix("MemAvailable:"))
@@ -112,6 +146,13 @@ fn host_fallbacks() -> Result<ResourceFallbacks, SandboxError> {
     let cpu_millis = u64::try_from(std::thread::available_parallelism()?.get())
         .unwrap_or(u64::MAX)
         .saturating_mul(1000);
+    if !count_tasks {
+        return Ok(ResourceFallbacks {
+            memory_bytes,
+            cpu_millis,
+            pids: u64::MAX,
+        });
+    }
     let pid_max = parse_number(&fs::read_to_string("/proc/sys/kernel/pid_max")?)?;
     let task_count = fs::read_dir("/proc")?
         .filter_map(Result::ok)

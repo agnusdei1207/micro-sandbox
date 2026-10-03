@@ -1,6 +1,6 @@
 use crate::error::SandboxError;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 #[derive(Debug)]
 pub struct PidFd(OwnedFd);
@@ -17,6 +17,11 @@ impl PidFd {
         }
         // SAFETY: a successful pidfd_open returns a new owned file descriptor.
         Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// Wraps a descriptor that the kernel returned as a pidfd, e.g. from `CLONE_PIDFD`.
+    pub(crate) const fn from_owned(fd: OwnedFd) -> Self {
+        Self(fd)
     }
 
     pub fn send_signal(&self, signal: i32) -> Result<(), SandboxError> {
@@ -38,5 +43,11 @@ impl PidFd {
             }
         }
         Ok(())
+    }
+}
+
+impl AsRawFd for PidFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
     }
 }

@@ -1,5 +1,7 @@
 use crate::error::SandboxError;
+use std::ffi::CString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 pub fn resolve_runtime_directory(
@@ -14,4 +16,10 @@ pub fn resolve_runtime_directory(
         )));
     }
     Ok(resolved)
+}
+
+/// Converts a host path into a NUL-terminated C string for a syscall.
+pub fn path_cstring(path: &Path) -> Result<CString, SandboxError> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| SandboxError::PolicyViolation("path contains NUL".into()))
 }

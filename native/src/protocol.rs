@@ -59,9 +59,7 @@ pub fn decode_request(frame: &[u8]) -> Result<Request, SandboxError> {
             request.version
         )));
     }
-    if request.kind.is_empty() {
-        return Err(SandboxError::Protocol("request type is empty".into()));
-    }
+    // An empty or unknown type is answered by the supervisor as an unsupported request.
     Ok(request)
 }
 

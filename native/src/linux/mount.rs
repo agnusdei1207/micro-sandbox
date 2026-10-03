@@ -1,10 +1,12 @@
 use crate::artifact::ValidatedWorkspace;
 use crate::error::SandboxError;
-use crate::linux::paths::resolve_runtime_directory;
-use std::ffi::CString;
+use crate::linux::os_error;
+use crate::linux::paths::{path_cstring, resolve_runtime_directory};
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 const RUNTIME_DIRS: [&str; 5] = ["bin", "sbin", "usr", "lib", "lib64"];
@@ -106,7 +108,17 @@ fn bind_artifacts(workspace: &ValidatedWorkspace, new_root: &Path) -> Result<(),
     )?;
     for declared in &workspace.outputs {
         let target = output_target.join(&declared.relative);
+        // The pinned handle's mount belongs to the launcher's original mount namespace and
+        // cannot be a bind source here, so bind the host path and then require that the
+        // writable mount resolves to the validated inode.
         mount(Some(&declared.host), &target, None, libc::MS_BIND, None)?;
+        let mounted = fs::metadata(&target)?;
+        let pinned = declared.handle.metadata()?;
+        if (mounted.dev(), mounted.ino()) != (pinned.dev(), pinned.ino()) {
+            return Err(SandboxError::Security(
+                "declared artifact output changed before it was mounted".into(),
+            ));
+        }
         set_mount_attributes_recursive(
             &target,
             MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC,
@@ -121,13 +133,7 @@ fn mount_safe_devices(new_root: &Path) -> Result<(), SandboxError> {
         let target = new_root.join("dev").join(name);
         fs::File::create(&target)?;
         mount(Some(&source), &target, None, libc::MS_BIND, None)?;
-        mount(
-            None,
-            &target,
-            None,
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NOEXEC,
-            None,
-        )?;
+        set_mount_attributes_recursive(&target, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NOEXEC)?;
     }
     Ok(())
 }
@@ -167,31 +173,28 @@ fn set_mount_attributes_recursive(target: &Path, attributes: u64) -> Result<(), 
         )
     };
     if result == -1 {
-        return Err(operation_error("mount_setattr"));
+        return Err(os_error("mount_setattr"));
     }
     Ok(())
 }
 
 fn pivot_root(new_root: &Path) -> Result<(), SandboxError> {
-    let new_root_c = path_cstring(new_root)?;
+    let new_root = path_cstring(new_root)?;
     // SAFETY: new_root names a mounted directory created by this process.
-    if unsafe { libc::chdir(new_root_c.as_ptr()) } == -1 {
-        return Err(operation_error("chdir new root"));
+    if unsafe { libc::chdir(new_root.as_ptr()) } == -1 {
+        return Err(os_error("chdir new root"));
     }
-    let dot = CString::new(".").expect("literal has no NUL");
-    let old = CString::new(".old_root").expect("literal has no NUL");
     // SAFETY: both paths are directories beneath the new root mount.
-    if unsafe { libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), old.as_ptr()) } == -1 {
-        return Err(operation_error("pivot_root"));
+    if unsafe { libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".old_root".as_ptr()) } == -1 {
+        return Err(os_error("pivot_root"));
     }
-    let slash = CString::new("/").expect("literal has no NUL");
-    // SAFETY: slash is a valid directory after pivot_root.
-    if unsafe { libc::chdir(slash.as_ptr()) } == -1 {
-        return Err(operation_error("chdir /"));
+    // SAFETY: "/" is a valid directory after pivot_root.
+    if unsafe { libc::chdir(c"/".as_ptr()) } == -1 {
+        return Err(os_error("chdir /"));
     }
     // SAFETY: /.old_root is the detached previous root mount.
-    if unsafe { libc::umount2(old_root().as_ptr(), libc::MNT_DETACH) } == -1 {
-        return Err(operation_error("unmount old root"));
+    if unsafe { libc::umount2(c"/.old_root".as_ptr(), libc::MNT_DETACH) } == -1 {
+        return Err(os_error("unmount old root"));
     }
     fs::remove_dir("/.old_root")?;
     Ok(())
@@ -230,32 +233,83 @@ fn mount(
         )
     };
     if result == -1 {
-        return Err(operation_error(&format!(
-            "mount {}",
+        // Capture errno before formatting allocates.
+        let error = io::Error::last_os_error();
+        return Err(SandboxError::Security(format!(
+            "mount {}: {error}",
             target.to_string_lossy()
         )));
     }
     Ok(())
 }
 
-fn path_cstring(path: &Path) -> Result<CString, SandboxError> {
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| SandboxError::PolicyViolation("path contains NUL".into()))
+/// Private per-user directory holding job staging roots.
+///
+/// The supervisor and its launchers share the environment, so both resolve the same path.
+pub fn staging_base() -> PathBuf {
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    std::env::temp_dir().join(format!("micro-sandbox-{uid}"))
 }
 
-fn old_root() -> CString {
-    CString::new("/.old_root").expect("literal has no NUL")
-}
-
-fn operation_error(operation: &str) -> SandboxError {
-    SandboxError::Security(format!("{operation}: {}", io::Error::last_os_error()))
-}
-
+/// Creates an unpredictable, private, empty staging root for one job.
 pub fn create_staging_root(job_id: &str) -> Result<PathBuf, SandboxError> {
-    let path = PathBuf::from(format!(
-        "/tmp/micro-sandbox-{job_id}-{}",
-        std::process::id()
-    ));
-    fs::create_dir(&path)?;
-    Ok(path)
+    let base = staging_base();
+    match fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(SandboxError::Io(error)),
+    }
+    let metadata = fs::symlink_metadata(&base)?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(SandboxError::Security(format!(
+            "staging directory {} must be a private directory owned by the service user",
+            base.display()
+        )));
+    }
+    let mut template = path_cstring(&base.join(format!("{job_id}-XXXXXX")))?.into_bytes_with_nul();
+    // SAFETY: template is a writable NUL-terminated buffer ending in XXXXXX.
+    if unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) }.is_null() {
+        return Err(os_error("mkdtemp staging root"));
+    }
+    template.pop();
+    Ok(PathBuf::from(OsString::from_vec(template)))
+}
+
+/// Lists staging roots as `(job ID, path)` pairs.
+pub fn staging_roots() -> io::Result<Vec<(String, PathBuf)>> {
+    let entries = match fs::read_dir(staging_base()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if let Some((job_id, _)) = name.to_str().and_then(|name| name.rsplit_once('-')) {
+            roots.push((job_id.to_owned(), entry.path()));
+        }
+    }
+    Ok(roots)
+}
+
+/// Removes every staging root left by `job_id`, e.g. after its launcher was killed.
+pub fn remove_staging_roots(job_id: &str) -> io::Result<()> {
+    for (owner, path) in staging_roots()? {
+        if owner == job_id {
+            remove_staging_root(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes one empty staging root; a missing directory counts as removed.
+pub fn remove_staging_root(path: &Path) -> io::Result<()> {
+    match fs::remove_dir(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }

@@ -37,6 +37,21 @@ fn guest_cannot_change_its_parent_death_signal() {
 }
 
 #[test]
+fn baseline_filter_blocks_escape_syscalls_and_allows_harmless_ioctls() {
+    // Filters apply to the calling thread; keep the test harness unrestricted.
+    let probes = std::thread::spawn(|| {
+        micro_sandbox_native::linux::seccomp::apply_baseline().unwrap();
+        micro_sandbox_native::linux::seccomp::probe_baseline()
+    })
+    .join()
+    .unwrap();
+    assert!(probes.len() >= 15);
+    for (name, passed) in probes {
+        assert!(passed, "{name}");
+    }
+}
+
+#[test]
 #[ignore = "requires the privileged Linux kernel test runner"]
 fn security_probe_drops_privilege_and_blocks_dangerous_syscalls() {
     let output = Command::new(env!("CARGO_BIN_EXE_micro-sandbox"))
@@ -67,4 +82,9 @@ fn security_probe_drops_privilege_and_blocks_dangerous_syscalls() {
     assert_eq!(report["fallocateBlocked"], true);
     assert_eq!(report["ioUringBlocked"], true);
     assert_eq!(report["preallocationIoctlBlocked"], true);
+    let probes = report["syscallProbes"].as_object().unwrap();
+    assert!(probes.len() >= 15);
+    for (name, passed) in probes {
+        assert_eq!(passed, true, "{name}");
+    }
 }
