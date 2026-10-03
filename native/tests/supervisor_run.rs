@@ -40,6 +40,10 @@ fn supervisor_cancels_a_running_process_tree() {
         }),
     );
     let owned_job = wait_for_owned_job(std::path::Path::new(&cgroup_root), supervisor.id(), 51);
+    let job_id = owned_job.file_name().unwrap().to_str().unwrap().to_owned();
+    // The launcher creates its staging root before the cgroup, and a SIGKILLed launcher
+    // cannot remove it itself.
+    assert_eq!(staging_roots_for(&job_id), 1);
     send(
         &mut supervisor,
         json!({
@@ -58,7 +62,57 @@ fn supervisor_cancels_a_running_process_tree() {
             .join(owned_job.file_name().unwrap())
             .exists()
     );
+    assert_eq!(staging_roots_for(&job_id), 0, "staging root leaked");
     stop_supervisor(supervisor);
+}
+
+#[test]
+#[ignore = "requires the privileged Linux kernel test runner"]
+fn launcher_errors_keep_their_original_code() {
+    let mut supervisor = start_supervisor();
+    let mut payload = spec("ignored", "", 2_000);
+    payload["command"] = json!("/definitely/missing/command");
+    send(
+        &mut supervisor,
+        json!({ "version": 1, "id": 31, "type": "run", "payload": payload }),
+    );
+    let response = receive(&mut supervisor);
+    assert_eq!(response["id"], 31);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "POLICY_VIOLATION", "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("command does not exist"),
+        "{response}"
+    );
+
+    // Malformed requests are answered without stopping the supervisor.
+    send(
+        &mut supervisor,
+        json!({ "version": 1, "id": 32, "type": "cancel", "payload": {} }),
+    );
+    assert_eq!(receive(&mut supervisor)["error"]["code"], "PROTOCOL_ERROR");
+    send(
+        &mut supervisor,
+        json!({ "version": 1, "id": 33, "type": "run", "payload": { "bogus": true } }),
+    );
+    assert_eq!(receive(&mut supervisor)["error"]["code"], "PROTOCOL_ERROR");
+    send(
+        &mut supervisor,
+        json!({ "version": 1, "id": 34, "type": "health", "payload": {} }),
+    );
+    assert_eq!(receive(&mut supervisor)["ok"], true);
+    stop_supervisor(supervisor);
+}
+
+fn staging_roots_for(job_id: &str) -> usize {
+    micro_sandbox_native::linux::mount::staging_roots()
+        .unwrap()
+        .into_iter()
+        .filter(|(owner, _)| owner == job_id)
+        .count()
 }
 
 #[test]
@@ -87,6 +141,12 @@ fn a_restarted_supervisor_reconciles_jobs_left_by_a_crash() {
     let response = receive(&mut restarted);
     assert_eq!(response["ok"], true, "{response}");
     assert!(!stale.exists());
+    let stale_id = stale.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        staging_roots_for(stale_id),
+        0,
+        "stale staging root survived"
+    );
     stop_supervisor(restarted);
 }
 

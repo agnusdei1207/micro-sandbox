@@ -66,6 +66,10 @@ export interface JobMetrics {
 
 export interface JobResult {
   readonly exitCode: number | null;
+  /**
+   * Number of the Linux signal that terminated the guest process (for example `9` for
+   * SIGKILL), or `null` when it exited normally. This is not an `AbortSignal`.
+   */
   readonly signal: number | null;
   readonly timedOut: boolean;
   readonly outputLimitExceeded: boolean;
@@ -77,8 +81,12 @@ export interface JobResult {
   readonly artifacts: readonly Readonly<OutputArtifact>[];
 }
 
+/**
+ * Internal boundary between the queue and the native supervisor. Results are untrusted
+ * wire data and must be validated by the caller.
+ */
 export interface SupervisorRequester {
-  request<T>(type: string, payload: unknown, signal?: AbortSignal): Promise<T>;
+  request(type: string, payload: unknown, signal?: AbortSignal): Promise<unknown>;
   close(): Promise<void>;
 }
 

@@ -1,10 +1,12 @@
-use micro_sandbox_native::error::SandboxError;
+use micro_sandbox_native::error::{ErrorBody, SandboxError};
 use micro_sandbox_native::protocol::MAX_FRAME_BYTES;
 use serde_json::json;
 use std::io::{self, Read};
 
 fn main() {
-    let result = match std::env::args().nth(1).as_deref() {
+    let mode = std::env::args().nth(1);
+    let result = match mode.as_deref() {
+        #[cfg(target_os = "linux")]
         Some("supervise") => micro_sandbox_native::supervisor::supervise(),
         #[cfg(target_os = "linux")]
         Some("security-probe") => security_probe(),
@@ -21,7 +23,12 @@ fn main() {
         )),
     };
     if let Err(error) = result {
-        eprintln!("{}: {error}", error.code());
+        if mode.as_deref() == Some("launch") {
+            // The supervisor parses this line to relay the original error code.
+            eprintln!("{}", json!({ "error": ErrorBody::from(&error) }));
+        } else {
+            eprintln!("{}: {error}", error.code());
+        }
         std::process::exit(1);
     }
 }
@@ -29,7 +36,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn launch() -> Result<(), SandboxError> {
     use micro_sandbox_native::job::{LaunchSpec, launch};
-    use std::path::PathBuf;
+    use micro_sandbox_native::linux::cgroup;
 
     let mut input = Vec::new();
     io::stdin()
@@ -38,13 +45,9 @@ fn launch() -> Result<(), SandboxError> {
     if input.len() > MAX_FRAME_BYTES {
         return Err(SandboxError::Protocol("launch spec exceeds 1 MiB".into()));
     }
-    let spec: LaunchSpec = serde_json::from_slice(&input)?;
-    let cgroup_root = std::env::var_os("MICRO_SANDBOX_CGROUP_ROOT")
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            SandboxError::CgroupUnavailable("MICRO_SANDBOX_CGROUP_ROOT is not set".into())
-        })?;
-    let result = launch(spec, &cgroup_root)?;
+    let spec: LaunchSpec = serde_json::from_slice(&input)
+        .map_err(|error| SandboxError::Protocol(format!("invalid launch spec: {error}")))?;
+    let result = launch(spec, &cgroup::root_from_env()?)?;
     serde_json::to_writer(io::stdout().lock(), &result)?;
     Ok(())
 }
@@ -76,7 +79,9 @@ fn namespace_probe() -> Result<(), SandboxError> {
             }
         }
         CloneOutcome::Child(child) => {
-            if let Err(error) = child.wait_for_mapping().and_then(|()| {
+            // Never unwind out of the child: that would run copies of the parent's state.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                child.wait_for_mapping()?;
                 let changed: BTreeMap<_, _> = namespace_names
                     .iter()
                     .map(|name| {
@@ -88,19 +93,24 @@ fn namespace_probe() -> Result<(), SandboxError> {
                 println!(
                     "{}",
                     json!({
+                        // SAFETY: getpid has no preconditions.
                         "pidInside": unsafe { libc::getpid() },
                         "networkDisconnected": network_disconnected,
                         "changed": changed,
                     })
                 );
-                Ok(())
-            }) {
-                eprintln!("{}: {error}", error.code());
-                // SAFETY: _exit terminates only the isolated child without running copied guards.
-                unsafe { libc::_exit(1) };
-            }
-            // SAFETY: _exit avoids unwinding copied parent state after clone3.
-            unsafe { libc::_exit(0) };
+                Ok::<(), SandboxError>(())
+            }))
+            .unwrap_or_else(|_| Err(SandboxError::Security("namespace probe panicked".into())));
+            let code = match outcome {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("{}: {error}", error.code());
+                    1
+                }
+            };
+            // SAFETY: _exit terminates only the isolated child without running copied guards.
+            unsafe { libc::_exit(code) };
         }
     }
     Ok(())
@@ -108,8 +118,6 @@ fn namespace_probe() -> Result<(), SandboxError> {
 
 #[cfg(target_os = "linux")]
 fn network_is_disconnected() -> Result<bool, SandboxError> {
-    use std::io;
-
     // SAFETY: socket arguments are valid and return a new descriptor on success.
     let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if socket == -1 {
@@ -143,55 +151,59 @@ fn network_is_disconnected() -> Result<bool, SandboxError> {
 
 #[cfg(target_os = "linux")]
 fn security_probe() -> Result<(), SandboxError> {
-    use micro_sandbox_native::linux::{capabilities, seccomp};
+    use micro_sandbox_native::linux::{self, capabilities, seccomp};
+    use std::collections::BTreeMap;
 
-    seccomp::apply_baseline()?;
-    capabilities::drop_all()?;
+    fn returns(result: libc::c_long, errno: i32) -> bool {
+        result == -1 && io::Error::last_os_error().raw_os_error() == Some(errno)
+    }
+
+    // Use the production hardening sequence so the probe observes the same state as a guest.
+    linux::harden(None)?;
     let masks = capabilities::capability_masks()?;
-    // SAFETY: both calls intentionally use invalid/null arguments; seccomp must reject them first.
-    let ptrace = unsafe { libc::syscall(libc::SYS_ptrace, libc::PTRACE_ATTACH, 1, 0, 0) };
-    let ptrace_blocked =
-        ptrace == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    // SAFETY: null pointers are never dereferenced because seccomp rejects SYS_mount.
-    let mount = unsafe {
-        libc::syscall(
-            libc::SYS_mount,
-            std::ptr::null::<libc::c_char>(),
-            std::ptr::null::<libc::c_char>(),
-            std::ptr::null::<libc::c_char>(),
-            0,
-            std::ptr::null::<libc::c_void>(),
+    // SAFETY: all calls below intentionally use invalid/null arguments; seccomp must
+    // reject them before the kernel inspects those arguments.
+    let (ptrace, mount, fsopen, clone3, fallocate, io_uring) = unsafe {
+        (
+            returns(
+                libc::syscall(libc::SYS_ptrace, libc::PTRACE_ATTACH, 1, 0, 0),
+                libc::EPERM,
+            ),
+            returns(
+                libc::syscall(
+                    libc::SYS_mount,
+                    std::ptr::null::<libc::c_char>(),
+                    std::ptr::null::<libc::c_char>(),
+                    std::ptr::null::<libc::c_char>(),
+                    0,
+                    std::ptr::null::<libc::c_void>(),
+                ),
+                libc::EPERM,
+            ),
+            returns(
+                libc::syscall(libc::SYS_fsopen, std::ptr::null::<libc::c_char>(), 0),
+                libc::EPERM,
+            ),
+            returns(
+                libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0),
+                libc::ENOSYS,
+            ),
+            returns(
+                libc::syscall(libc::SYS_fallocate, -1, 1, 0, 1024),
+                libc::EPERM,
+            ),
+            returns(
+                libc::syscall(
+                    libc::SYS_io_uring_setup,
+                    1,
+                    std::ptr::null::<libc::c_void>(),
+                ),
+                libc::EPERM,
+            ),
         )
     };
-    let mount_blocked =
-        mount == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    // SAFETY: seccomp rejects these syscalls before their invalid arguments are inspected.
-    let fsopen = unsafe { libc::syscall(libc::SYS_fsopen, std::ptr::null::<libc::c_char>(), 0) };
-    let new_mount_api_blocked =
-        fsopen == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    // SAFETY: seccomp rejects clone3 before dereferencing its null argument.
-    let clone3 = unsafe { libc::syscall(libc::SYS_clone3, std::ptr::null::<libc::c_void>(), 0) };
-    let namespace_creation_blocked =
-        clone3 == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS);
-    // SAFETY: seccomp rejects allocation and io_uring syscalls before inspecting arguments.
-    let fallocate = unsafe { libc::syscall(libc::SYS_fallocate, -1, 1, 0, 1024) };
-    let fallocate_blocked =
-        fallocate == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    // SAFETY: seccomp rejects io_uring_setup before dereferencing its null argument.
-    let io_uring = unsafe {
-        libc::syscall(
-            libc::SYS_io_uring_setup,
-            1,
-            std::ptr::null::<libc::c_void>(),
-        )
-    };
-    let io_uring_blocked =
-        io_uring == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-    // SAFETY: the invalid descriptor probes whether seccomp rejects this command
-    // before the kernel validates the file descriptor.
-    let preallocation_ioctl = unsafe { libc::syscall(libc::SYS_ioctl, -1, 0x5828_u64, 0) };
-    let preallocation_ioctl_blocked = preallocation_ioctl == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    let probes: BTreeMap<_, _> = seccomp::probe_baseline().into_iter().collect();
+    let preallocation_ioctl_blocked = probes["ioctl_resvsp"];
 
     println!(
         "{}",
@@ -202,13 +214,14 @@ fn security_probe() -> Result<(), SandboxError> {
             "inheritableCapabilities": masks.inheritable,
             "boundingCapabilities": masks.bounding,
             "ambientCapabilities": masks.ambient,
-            "ptraceBlocked": ptrace_blocked,
-            "mountBlocked": mount_blocked,
-            "newMountApiBlocked": new_mount_api_blocked,
-            "namespaceCreationBlocked": namespace_creation_blocked,
-            "fallocateBlocked": fallocate_blocked,
-            "ioUringBlocked": io_uring_blocked,
+            "ptraceBlocked": ptrace,
+            "mountBlocked": mount,
+            "newMountApiBlocked": fsopen,
+            "namespaceCreationBlocked": clone3,
+            "fallocateBlocked": fallocate,
+            "ioUringBlocked": io_uring,
             "preallocationIoctlBlocked": preallocation_ioctl_blocked,
+            "syscallProbes": probes,
         })
     );
     Ok(())

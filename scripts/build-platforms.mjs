@@ -1,26 +1,14 @@
-import { spawnSync } from 'node:child_process';
 import process from 'node:process';
+import { run } from './lib/exec.mjs';
+import { IMAGES, parseCurrentArch, selectedPlatforms } from './lib/platforms.mjs';
 
 const mount = `${process.cwd()}:/work`;
-const current = process.argv.find((value) => value.startsWith('--current='))?.split('=')[1];
-const platforms = [
-  { npmArch: 'x64', dockerArch: 'amd64' },
-  { npmArch: 'arm64', dockerArch: 'arm64' },
-];
-if (current !== undefined && !platforms.some((platform) => platform.npmArch === current)) {
-  throw new Error(`Unsupported build architecture ${JSON.stringify(current)}`);
-}
-for (const platform of platforms) {
-  if (current !== undefined && current !== platform.npmArch) continue;
-  run([
-    'run', '--rm', '--platform', `linux/${platform.dockerArch}`, '-v', mount, '-w', '/work',
-    'rust:1.97.1-alpine', 'sh', '-c',
-    `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/target cargo build --locked --release --manifest-path native/Cargo.toml && mkdir -p npm/linux-${platform.npmArch}/bin && cp /tmp/target/release/micro-sandbox npm/linux-${platform.npmArch}/bin/micro-sandbox && chmod 755 npm/linux-${platform.npmArch}/bin/micro-sandbox`,
-  ]);
-}
-
-function run(args) {
-  const result = spawnSync('docker', args, { stdio: 'inherit', shell: false });
-  if (result.error) throw result.error;
-  if (result.status !== 0) process.exit(result.status ?? 1);
+const current = parseCurrentArch(process.argv, { label: 'build' });
+for (const platform of selectedPlatforms(current)) {
+  const output = `${platform.directory}/bin`;
+  run('docker', [
+    'run', '--rm', '--platform', platform.dockerPlatform, '-v', mount, '-w', '/work',
+    IMAGES.rustAlpine, 'sh', '-c',
+    `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/target cargo build --locked --release --manifest-path native/Cargo.toml && mkdir -p ${output} && cp /tmp/target/release/micro-sandbox ${output}/micro-sandbox && chmod 755 ${output}/micro-sandbox`,
+  ], { label: `docker native build for ${platform.arch}` });
 }

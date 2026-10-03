@@ -1,42 +1,21 @@
-import { readdir, readFile } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
-import path from 'node:path';
-import process from 'node:process';
-import { requirePackageTarball } from './package-artifacts.mjs';
+import { readFile } from 'node:fs/promises';
+import { runNpm } from './lib/exec.mjs';
+import { publishUnlessPresent } from './lib/npm-publish.mjs';
+import { PLATFORMS } from './lib/platforms.mjs';
+import { verifyReleaseArtifacts } from './release-artifacts.mjs';
 
+// Publishes the checksum-verified release artifacts with provenance. A version
+// already in the registry is skipped only when its integrity matches.
 const root = JSON.parse(await readFile('package.json', 'utf8'));
-const files = await readdir('artifacts');
-const packages = [
-  'micro-sandbox-linux-x64',
-  'micro-sandbox-linux-arm64',
-  root.name,
-].map((name) => ({
-  name,
-  target: path.resolve('artifacts', requirePackageTarball(files, name, root.version)),
-}));
-for (const { name, target } of packages) {
-  publishUnlessPresent(name, target);
-}
-
-function publishUnlessPresent(name, target) {
-  if (run(['view', `${name}@${root.version}`, 'version'], true).status === 0) return;
-  const result = run(['publish', target, '--access', 'public', '--provenance'], true);
-  process.stdout.write(result.stdout ?? '');
-  process.stderr.write(result.stderr ?? '');
-  if (result.status === 0 || alreadyPublished(result)) return;
-  process.exit(result.status ?? 1);
-}
-
-function run(args, quiet) {
-  return spawnSync('npm', args, {
-    encoding: 'utf8',
-    stdio: quiet ? 'pipe' : 'inherit',
-    shell: false,
+const tarballs = verifyReleaseArtifacts({ directory: 'artifacts', mainName: root.name, version: root.version });
+// Fail on a broken token even when every package already exists.
+runNpm(['whoami'], { label: 'npm authentication' });
+for (const name of [...PLATFORMS.map((platform) => platform.name), root.name]) {
+  publishUnlessPresent({
+    name,
+    version: root.version,
+    tarball: tarballs.get(name),
+    provenance: true,
+    npm: (args) => runNpm(args, { capture: true, allowFailure: true }),
   });
-}
-
-function alreadyPublished(result) {
-  return /previously published versions|cannot publish over/i.test(
-    `${result.stdout ?? ''}\n${result.stderr ?? ''}`,
-  );
 }

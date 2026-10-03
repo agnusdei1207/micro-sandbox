@@ -1,4 +1,5 @@
-import { SandboxError } from '../errors.js';
+import { policyError } from '../errors.js';
+import { layerKnownKeys, rejectUnknownKeys } from './resolve.js';
 import type { ArtifactLimits } from '../types.js';
 
 export const DEFAULT_ARTIFACT_LIMITS: Readonly<ArtifactLimits> = Object.freeze({
@@ -19,30 +20,34 @@ export const DEFAULT_ARTIFACT_CEILINGS: Readonly<ArtifactLimits> = Object.freeze
   outputFileBytes: 256 * 1024 * 1024,
 });
 
+/** The exact key set the native `ArtifactLimits` accepts (`deny_unknown_fields`). */
+export const ARTIFACT_LIMIT_KEYS = Object.freeze(
+  Object.keys(DEFAULT_ARTIFACT_LIMITS) as Array<keyof ArtifactLimits>,
+);
+
 export function resolveArtifactLimits(
   configuredDefaults: Partial<ArtifactLimits>,
   configuredCeilings: Partial<ArtifactLimits>,
   requested: Partial<ArtifactLimits>,
 ): Readonly<ArtifactLimits> {
-  const defaults = { ...DEFAULT_ARTIFACT_LIMITS, ...configuredDefaults };
-  const ceilings = { ...DEFAULT_ARTIFACT_CEILINGS, ...configuredCeilings };
-  const limits = { ...defaults, ...requested };
-  if (requested.outputFileBytes === undefined) {
-    limits.outputFileBytes = Math.min(limits.outputFileBytes, limits.outputBytes);
-  }
-  for (const key of Object.keys(DEFAULT_ARTIFACT_LIMITS) as Array<keyof ArtifactLimits>) {
+  rejectUnknownKeys('artifactDefaults', configuredDefaults, ARTIFACT_LIMIT_KEYS);
+  rejectUnknownKeys('artifactCeilings', configuredCeilings, ARTIFACT_LIMIT_KEYS);
+  rejectUnknownKeys('artifacts.limits', requested, ARTIFACT_LIMIT_KEYS);
+  const defaults = layerKnownKeys(ARTIFACT_LIMIT_KEYS, DEFAULT_ARTIFACT_LIMITS, configuredDefaults);
+  const ceilings = layerKnownKeys(ARTIFACT_LIMIT_KEYS, DEFAULT_ARTIFACT_CEILINGS, configuredCeilings);
+  const layered = layerKnownKeys(ARTIFACT_LIMIT_KEYS, defaults, requested);
+  const limits: ArtifactLimits = requested.outputFileBytes === undefined
+    ? { ...layered, outputFileBytes: Math.min(layered.outputFileBytes, layered.outputBytes) }
+    : layered;
+  for (const key of ARTIFACT_LIMIT_KEYS) {
     for (const [label, values] of [['default', defaults], ['ceiling', ceilings], ['requested', limits]] as const) {
-      if (!Number.isSafeInteger(values[key]) || values[key] <= 0) violation(`${label} artifact ${key} is invalid`);
+      if (!Number.isSafeInteger(values[key]) || values[key] <= 0) throw policyError(`${label} artifact ${key} is invalid`);
     }
     if (defaults[key] > ceilings[key] || limits[key] > ceilings[key]) {
-      violation(`Artifact ${key} exceeds its ceiling`);
+      throw policyError(`Artifact ${key} exceeds its ceiling`);
     }
   }
-  if (limits.outputFileBytes > limits.outputBytes) violation('Artifact outputFileBytes exceeds outputBytes');
-  if (limits.inputFileBytes > limits.inputBytes) violation('Artifact inputFileBytes exceeds inputBytes');
+  if (limits.outputFileBytes > limits.outputBytes) throw policyError('Artifact outputFileBytes exceeds outputBytes');
+  if (limits.inputFileBytes > limits.inputBytes) throw policyError('Artifact inputFileBytes exceeds inputBytes');
   return Object.freeze(limits);
-}
-
-function violation(message: string): never {
-  throw new SandboxError('POLICY_VIOLATION', message);
 }

@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_RAW_IO_BYTES: u64 = 512 * 1024;
+/// cgroup v2 `cpu.max` period used for every job.
+pub const CPU_PERIOD_MICROS: u64 = 100_000;
+/// Smallest quota accepted by the kernel for `cpu.max`.
+const MIN_CPU_QUOTA_MICROS: u64 = 1_000;
+/// Upper bound on a job's CPU limit, expressed in CPUs.
+const MAX_CPUS: f64 = 1_024.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -35,5 +41,18 @@ impl ResourceLimits {
             return Err("output limit must be between 1 byte and 512 KiB");
         }
         Ok(())
+    }
+
+    /// Returns the `cpu.max` quota for [`CPU_PERIOD_MICROS`], rejecting values the
+    /// kernel would refuse or that cannot be represented exactly.
+    pub fn cpu_quota_micros(self) -> Result<u64, &'static str> {
+        if !self.cpu.is_finite() || self.cpu <= 0.0 || self.cpu > MAX_CPUS {
+            return Err("CPU limit must be positive, finite, and at most 1024 CPUs");
+        }
+        let quota = (self.cpu * CPU_PERIOD_MICROS as f64).round() as u64;
+        if quota < MIN_CPU_QUOTA_MICROS {
+            return Err("CPU limit must be at least 0.01 CPUs");
+        }
+        Ok(quota)
     }
 }

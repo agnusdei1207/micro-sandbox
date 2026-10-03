@@ -1,9 +1,7 @@
 import path from 'node:path';
-import { SandboxError } from '../errors.js';
+import { ID_PATTERN, policyError } from '../errors.js';
 import { normalizeGuestPath } from '../policy/paths.js';
 import type { RuntimeDefinition } from '../types.js';
-
-const ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62})$/;
 
 export class RuntimeRegistry {
   private readonly runtimes = new Map<string, Readonly<RuntimeDefinition>>();
@@ -15,13 +13,13 @@ export class RuntimeRegistry {
 
   register(definition: RuntimeDefinition): Readonly<RuntimeDefinition> {
     if (this.locked) throw policyError('Runtimes must be registered before the supervisor starts');
-    if (!ID_PATTERN.test(definition.id)) {
+    if (typeof definition.id !== 'string' || !ID_PATTERN.test(definition.id)) {
       throw policyError('Runtime ID is invalid', { id: definition.id });
     }
     if (this.runtimes.has(definition.id)) {
       throw policyError('Runtime ID is already registered', { id: definition.id });
     }
-    if (!path.isAbsolute(definition.rootfs)) {
+    if (typeof definition.rootfs !== 'string' || !path.isAbsolute(definition.rootfs)) {
       throw policyError('Runtime rootfs must be an absolute host path');
     }
     normalizeGuestPath(definition.entrypoint);
@@ -42,8 +40,4 @@ export class RuntimeRegistry {
   entries(): readonly Readonly<RuntimeDefinition>[] {
     return Object.freeze([...this.runtimes.values()]);
   }
-}
-
-function policyError(message: string, details?: Record<string, unknown>): SandboxError {
-  return new SandboxError('POLICY_VIOLATION', message, details);
 }

@@ -1,7 +1,6 @@
-import { SandboxError } from '../errors.js';
+import { ID_PATTERN, policyError } from '../errors.js';
+import { validatePartialLimits } from '../policy/resolve.js';
 import type { ProfileDefinition, ResolvedProfile } from '../types.js';
-
-const ID_PATTERN = /^[a-z0-9](?:[a-z0-9._-]{0,62})$/;
 
 export class ProfileRegistry {
   private readonly profiles = new Map<string, Readonly<ResolvedProfile>>();
@@ -13,19 +12,17 @@ export class ProfileRegistry {
 
   define(name: string, definition: ProfileDefinition): Readonly<ResolvedProfile> {
     if (this.locked) {
-      throw new SandboxError('POLICY_VIOLATION', 'Profiles must be defined before the supervisor starts');
+      throw policyError('Profiles must be defined before the supervisor starts');
     }
     if (!ID_PATTERN.test(name) || this.profiles.has(name)) {
-      throw new SandboxError('POLICY_VIOLATION', 'Profile name is invalid or already used', {
-        name,
-      });
+      throw policyError('Profile name is invalid or already used', { name });
     }
     const base = definition.extends ? this.profiles.get(definition.extends) : undefined;
     if (definition.extends && !base) {
-      throw new SandboxError('POLICY_VIOLATION', 'Base profile is not registered', {
-        base: definition.extends,
-      });
+      throw policyError('Base profile is not registered', { base: definition.extends });
     }
+    // Shape and value checks happen here; operator ceilings still apply per run.
+    validatePartialLimits(`profiles.${name}.limits`, definition.limits);
     const profile = Object.freeze({
       name,
       limits: Object.freeze({ ...base?.limits, ...definition.limits }),
@@ -37,7 +34,7 @@ export class ProfileRegistry {
   get(name: string): Readonly<ResolvedProfile> {
     const profile = this.profiles.get(name);
     if (!profile) {
-      throw new SandboxError('POLICY_VIOLATION', 'Profile is not registered', { name });
+      throw policyError('Profile is not registered', { name });
     }
     return profile;
   }
