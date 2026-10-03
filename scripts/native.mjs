@@ -1,17 +1,32 @@
-import { spawnSync } from 'node:child_process';
 import process from 'node:process';
+import { run } from './lib/exec.mjs';
+import { IMAGES } from './lib/platforms.mjs';
+
+const MODES = {
+  test: {
+    privileged: false,
+    image: IMAGES.rustBookworm,
+    command: ['bash', '-c', 'rustup component add rustfmt clippy >/dev/null && cargo fmt --manifest-path native/Cargo.toml --check && cargo clippy --locked --manifest-path native/Cargo.toml --all-targets -- -D warnings && cargo test --locked --manifest-path native/Cargo.toml'],
+  },
+  kernel: {
+    privileged: true,
+    image: IMAGES.rustBookworm,
+    command: ['bash', 'scripts/run-native-privileged-tests.sh'],
+  },
+  integration: {
+    privileged: true,
+    image: IMAGES.nodeBookworm,
+    command: ['bash', 'scripts/run-node-integration.sh'],
+  },
+};
 
 const mode = process.argv[2] ?? 'test';
-if (!['test', 'kernel', 'integration'].includes(mode)) {
-  throw new Error(`Unsupported native test mode ${mode}`);
-}
-const cwd = process.cwd();
-const common = ['run', '--rm', '-e', 'CARGO_BUILD_JOBS=2', '-v', `${cwd}:/work`, '-w', '/work'];
-const args = mode === 'kernel'
-  ? [...common.slice(0, 2), '--privileged', '--cgroupns=private', ...common.slice(2), 'rust:1.97.1-bookworm', 'bash', 'scripts/run-native-privileged-tests.sh']
-  : mode === 'integration'
-    ? [...common.slice(0, 2), '--privileged', '--cgroupns=private', ...common.slice(2), 'node:24.18.0-bookworm', 'bash', 'scripts/run-node-integration.sh']
-  : [...common, 'rust:1.97.1-bookworm', 'bash', '-c', 'rustup component add rustfmt clippy >/dev/null && cargo fmt --manifest-path native/Cargo.toml --check && cargo clippy --manifest-path native/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path native/Cargo.toml'];
-const result = spawnSync('docker', args, { stdio: 'inherit', shell: false });
-if (result.error) throw result.error;
-process.exitCode = result.status ?? 1;
+const definition = Object.hasOwn(MODES, mode) ? MODES[mode] : undefined;
+if (!definition) throw new Error(`Unsupported native test mode ${mode}`);
+run('docker', [
+  'run', '--rm',
+  ...(definition.privileged ? ['--privileged', '--cgroupns=private'] : []),
+  '-e', 'CARGO_BUILD_JOBS=2',
+  '-v', `${process.cwd()}:/work`, '-w', '/work',
+  definition.image, ...definition.command,
+], { label: `native ${mode} tests` });

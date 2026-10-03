@@ -6,13 +6,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag matching the selected branch package version'
+        description: 'Existing release tag; the branch must be that tag commit or differ from it only in package-lock.json'
         required: true
         type: string
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: 2
@@ -29,35 +32,49 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
-          registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run release:verify -- "$RELEASE_TAG"
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       - run: npm run test
       - run: npm run test:native
+      # Advisories published after the tag must not block reruns; CI keeps this gate blocking.
       - run: npm audit --audit-level=moderate
+        continue-on-error: true
       - run: npm run build:native:docker -- --current=${{ matrix.arch }}
       - run: npm run package:verify -- --current=${{ matrix.arch }}
       - run: npm run test:kernel
       - run: npm run test:integration
       - run: npm run package:smoke -- --current=${{ matrix.arch }}
       - run: npm run package:smoke:pnpm -- --current=${{ matrix.arch }}
-      - run: sha256sum artifacts/*.tgz > artifacts/SHA256SUMS-${{ matrix.arch }}
+      # Stages this job's platform tarball (and the main tarball from x64 only) with SHA256SUMS-<arch>.
+      - run: node scripts/release-artifacts.mjs stage --current=${{ matrix.arch }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: platform-${{ matrix.arch }}
-          path: artifacts/*
+          path: artifacts/release/*
+          if-no-files-found: error
 
   publish:
     needs: platform
     runs-on: ubuntu-24.04
     environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24.18.0
@@ -67,13 +84,11 @@ jobs:
           pattern: platform-*
           path: artifacts
           merge-multiple: true
-      - run: sha256sum --check artifacts/SHA256SUMS-x64 artifacts/SHA256SUMS-arm64
       - run: npm run release:verify -- "$RELEASE_TAG"
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-      - run: npm whoami
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Verifies SHA256SUMS-x64/arm64 coverage, checks npm authentication, and
+      # publishes each missing package; existing versions must match by integrity.
       - run: node scripts/publish-if-missing.mjs
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

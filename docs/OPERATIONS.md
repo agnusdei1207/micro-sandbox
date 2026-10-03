@@ -66,17 +66,27 @@ CI runs native and kernel checks on x64 and ARM64. The release workflow defines 
 
 Synchronize the main package, both platform packages, and root optional-dependency requirements before releasing a new version. Published optional dependencies need matching lockfile version, registry URL, and integrity metadata. An unpublished platform version can use a lockfile entry containing only `"optional": true`, together with its exact root requirement; omitting the entry prevents `npm ci` from bootstrapping that version. Refresh registry metadata after publication.
 
-Build the selected native binaries before packing. On Windows, the package helpers pack platform archives inside Linux so the executable retains mode `0755`; packing those directories directly with Windows npm loses that mode. npm and pnpm can repair executable permissions during installation, so their success alone does not establish the archive contract.
+```sh
+npm run release:version -- 0.0.7
+```
+
+This sets the version in `package.json` (including both optional dependencies), both `npm/*/package.json` manifests, `native/Cargo.toml`, the `micro-sandbox-native` entry of `native/Cargo.lock`, and the root entries of `package-lock.json`. A platform lockfile entry whose metadata does not already match the new version becomes the `"optional": true` placeholder. `package:verify` and `release:verify` reject any version drift between these files.
+
+Build the selected native binaries before packing. Docker images used by the build, test, and packaging helpers are pinned by tag and multi-architecture index digest in `scripts/lib/platforms.mjs`; update the tag and digest together (`docker buildx imagetools inspect <image:tag>`). On Windows, the package helpers pack platform archives inside Linux so the executable retains mode `0755`; packing those directories directly with Windows npm loses that mode. npm and pnpm can repair executable permissions during installation, so their success alone does not establish the archive contract.
 
 ```sh
 npm run release:publish-local -- --main-only --dry-run
 ```
 
-This prepares a fresh main-package tarball in `artifacts/` without authentication or publication. Use `--all --dry-run` to prepare all three packages after building both native binaries. The local publication helper stages all selected packages before publishing those exact tarballs; it does not reuse cached tarballs. The hosted release workflow publishes its tested artifacts after checksum verification. A synchronized new version is needed to publish these changes; an existing registry version cannot be replaced.
+This prepares a fresh main-package tarball in `artifacts/` without authentication or publication. Use `--all --dry-run` to prepare all three packages after building both native binaries. The local publication helper requires a clean working tree (`--allow-dirty` is accepted only with `--dry-run`), runs package verification, and stages all selected packages before publishing those exact tarballs; it does not reuse cached tarballs. When platform packages are selected, it installs each staged platform tarball with the main tarball and checks the native SHA-256 and `--version` before anything is published; ARM64 runs under emulation on an x64 host.
 
-GitHub Actions does not read a developer's `.bashrc`. Store the npm token as `NPM_TOKEN` in this repository's `npm` environment. The publication job checks authentication explicitly, including reruns where all packages already exist. Its scripts use Node built-ins and do not need dependency installation.
+Both the local helper and the hosted workflow treat an already published version as success only when the registry `dist.integrity` equals the local tarball's SHA-512 integrity; a mismatch fails the publication. A synchronized new version is needed to publish changed contents; an existing registry version cannot be replaced.
 
-After publication, refresh optional-dependency metadata with `npm install --package-lock-only --ignore-scripts` and commit the lockfile. Unpublished placeholders stop satisfying `npm ci` once those versions become available. To recover on the updated branch without moving a published tag, manually run the Release workflow with the matching tag (for example, `v0.0.6`); it reruns both architecture gates and skips packages already published.
+The hosted release workflow uploads each platform tarball from its own architecture job and the main tarball from the x64 job only, each with a `SHA256SUMS-<arch>` file. The publication job verifies that every expected tarball is covered by exactly one checksum file before publishing. Only that job receives `id-token: write`, and runs for the same tag are serialized. `npm audit` is advisory in the release workflow so that new advisories do not block reruns of an existing tag; CI keeps it blocking.
+
+GitHub Actions does not read a developer's `.bashrc`. Store the npm token as `NPM_TOKEN` in this repository's `npm` environment. The publication script checks authentication explicitly, including reruns where all packages already exist. Its scripts use Node built-ins and do not need dependency installation.
+
+After publication, refresh optional-dependency metadata with `npm install --package-lock-only --ignore-scripts` and commit the lockfile. Unpublished placeholders stop satisfying `npm ci` once those versions become available. To recover without moving a published tag, manually run the Release workflow from a branch whose commit is the tag commit or a descendant of it that differs only in `package-lock.json`, passing the existing tag (for example, `v0.0.6`). `release:verify` rejects any other branch state. The run repeats both architecture gates and skips packages whose published integrity matches the rebuilt tarballs.
 
 ## Failure diagnosis
 
